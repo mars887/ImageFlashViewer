@@ -9,6 +9,7 @@ Usage
 - Select a folder in the left sidebar or paste a path and press Enter.
 - Left/Right: navigate images. Up/Down: mark positive/negative.
 - After marking, auto-advance to the next unreviewed image.
+- Hold `Del`: spotlight preview — the image under the mouse is shown over a dimmed background with small margins. Works in both single and grid modes.
 
 CLI
 - Export (CSV by default):

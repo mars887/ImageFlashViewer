@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 from PySide6.QtCore import Qt, QRect, QPoint, Signal
 from PySide6.QtGui import QPainter, QColor, QImage, QPixmap, QMouseEvent
 from PySide6.QtWidgets import QWidget
+from ..config import CONFIG
 
 
 class ViewGridWidget(QWidget):
@@ -18,7 +19,9 @@ class ViewGridWidget(QWidget):
         self._items: List[Dict] = []  # each: {index:int, path:str, status:int}
         self._images: Dict[int, QImage] = {}  # key: global index
         self._request_image = None  # callable(path, (w,h), callback)
+        self._page_info: Optional[Tuple[int, int, int]] = None  # start,end,total
         self.setMinimumSize(200, 200)
+        self.setMouseTracking(True)
 
     def set_request_image(self, fn) -> None:
         self._request_image = fn
@@ -39,13 +42,13 @@ class ViewGridWidget(QWidget):
 
     def viewport_tile_size(self) -> Tuple[int, int]:
         # Padding between tiles
-        spacing = 6
+        spacing = CONFIG.grid_tile_spacing
         w = max(1, (self.width() - (self._cols + 1) * spacing) // self._cols)
         h = max(1, (self.height() - (self._rows + 1) * spacing) // self._rows)
         return w, h
 
     def _tile_rect(self, r: int, c: int) -> QRect:
-        spacing = 6
+        spacing = CONFIG.grid_tile_spacing
         tw, th = self.viewport_tile_size()
         x = spacing + c * (tw + spacing)
         y = spacing + r * (th + spacing)
@@ -56,6 +59,10 @@ class ViewGridWidget(QWidget):
         self._items = items
         self._images.clear()
         self._load_visible_images()
+        self.update()
+
+    def set_page_info(self, start: int, end: int, total: int) -> None:
+        self._page_info = (start, end, total)
         self.update()
 
     def update_item_status(self, global_index: int, status: int) -> None:
@@ -83,7 +90,7 @@ class ViewGridWidget(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(18, 18, 18))
+        p.fillRect(self.rect(), QColor(*CONFIG.background_color))
 
         # Draw tiles
         i = 0
@@ -91,7 +98,7 @@ class ViewGridWidget(QWidget):
             for cc in range(self._cols):
                 rect = self._tile_rect(rr, cc)
                 # Draw background for tile
-                p.fillRect(rect, QColor(28, 28, 28))
+                p.fillRect(rect, QColor(*CONFIG.tile_background_color))
                 if i < len(self._items):
                     item = self._items[i]
                     img = self._images.get(item.get("index", -1))
@@ -105,13 +112,27 @@ class ViewGridWidget(QWidget):
                     # Status stripe
                     st = int(item.get("status", 0))
                     if st != 0:
-                        stripe_h = 8
-                        color = QColor(0, 200, 100, 160) if st > 0 else QColor(220, 60, 60, 160)
+                        stripe_h = CONFIG.grid_status_stripe_height
+                        color = QColor(*CONFIG.stripe_positive_color) if st > 0 else QColor(*CONFIG.stripe_negative_color)
                         p.fillRect(rect.x(), rect.y() + rect.height() - stripe_h, rect.width(), stripe_h, color)
                 # Border
-                p.setPen(QColor(60, 60, 60))
+                p.setPen(QColor(*CONFIG.border_color))
                 p.drawRect(rect)
                 i += 1
+
+        # Overlay page badge (compact): "start–end of total"
+        if self._page_info:
+            start, end, total = self._page_info
+            text = f"{start}\u2013{end} of {total}"
+            metrics_padding = 6
+            fm = self.fontMetrics()
+            tw = fm.horizontalAdvance(text) + metrics_padding * 2
+            th = fm.height() + metrics_padding
+            rect = QRect(8, 8, tw, th)
+            # Badge background with semi-transparency
+            p.fillRect(rect, QColor(0, 0, 0, 140))
+            p.setPen(QColor(230, 230, 230))
+            p.drawText(rect.adjusted(metrics_padding, 0, -metrics_padding, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         self.requestRescale.emit()
@@ -140,3 +161,15 @@ class ViewGridWidget(QWidget):
                 i += 1
         super().mousePressEvent(event)
 
+    def index_at_point(self, pt) -> Optional[int]:
+        # Returns global index for cell under point, or None
+        i = 0
+        for rr in range(self._rows):
+            for cc in range(self._cols):
+                if i < len(self._items):
+                    rect = self._tile_rect(rr, cc)
+                    if rect.contains(pt):
+                        item = self._items[i]
+                        return int(item.get("index"))
+                i += 1
+        return None

@@ -5,12 +5,13 @@ from typing import Callable, Dict, Optional, Tuple
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt
 from PySide6.QtGui import QImage
+from ..config import CONFIG
 
 
 def _normalize_size(size: Tuple[int, int]) -> Tuple[int, int]:
     # Reduce cache fragmentation by snapping to 64px grid
     w, h = size
-    snap = 64
+    snap = 16
     nw = max(snap, (w + snap - 1) // snap * snap)
     nh = max(snap, (h + snap - 1) // snap * snap)
     return nw, nh
@@ -47,10 +48,10 @@ class ImagePreloader(QObject):
     Simple threaded image preloader with in-memory LRU cache.
     """
 
-    def __init__(self, max_items: int = 200) -> None:
+    def __init__(self, max_items: int = None) -> None:
         super().__init__()
         self.pool = QThreadPool.globalInstance()
-        self.max_items = max_items
+        self.max_items = max_items if max_items is not None else CONFIG.preloader_max_items
         self.cache: "OrderedDict[Tuple[str, Tuple[int, int]], QImage]" = OrderedDict()
         self.signals = _WorkerSignals()
         self.signals.loaded.connect(self._on_loaded)
