@@ -86,9 +86,13 @@ class SQLiteRepository:
                     with open(deleted_csv, "a", newline="", encoding="utf-8") as f:
                         w = csv.writer(f)
                         if write_header:
-                            w.writerow(["timestamp", "filename"])  # header
+                            w.writerow(["timestamp", "filename", "reason"])  # header
                         for fn in missing:
-                            w.writerow([datetime.now().isoformat(timespec="seconds"), fn])
+                            w.writerow([
+                                datetime.now().isoformat(timespec="seconds"),
+                                fn,
+                                "not found",
+                            ])
                 except Exception:
                     # Logging failures shouldn't abort sync
                     pass
@@ -247,7 +251,7 @@ class SQLiteRepository:
             f_csv = open(deleted_csv, "a", newline="", encoding="utf-8")
             writer = csv.writer(f_csv)
             if write_header:
-                writer.writerow(["timestamp", "filename"])  # header
+                writer.writerow(["timestamp", "filename", "reason"])  # header
         except Exception:
             f_csv = None
             writer = None
@@ -259,7 +263,11 @@ class SQLiteRepository:
                     os.remove(path)
                     count += 1
                     if writer:
-                        writer.writerow([datetime.now().isoformat(timespec="seconds"), fn])
+                        writer.writerow([
+                            datetime.now().isoformat(timespec="seconds"),
+                            fn,
+                            "deleted as negative",
+                        ])
             except Exception:
                 # skip failures
                 pass
@@ -277,3 +285,77 @@ class SQLiteRepository:
             conn.commit()
 
         return count
+
+    def export_move_by_status(self, status: int, out_dir: str) -> int:
+        """
+        Move all images with the given status to the specified directory.
+        Records each move to move.csv (from -> to) and removes moved records
+        from the database. Returns count of moved files.
+        """
+        if not out_dir:
+            return 0
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Collect filenames by status
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT filename FROM images WHERE status = ?", (status,))
+            items = [row[0] for row in cur.fetchall()]
+
+        moved = 0
+        moved_names: list[str] = []
+
+        move_csv = os.path.join(self.folder, "move.csv")
+        write_header = not os.path.exists(move_csv)
+        try:
+            f_csv = open(move_csv, "a", newline="", encoding="utf-8")
+            w_csv = csv.writer(f_csv)
+            if write_header:
+                # As requested: write from-path and to-path
+                w_csv.writerow(["from", "to"])
+        except Exception:
+            f_csv = None
+            w_csv = None
+
+        for fn in items:
+            # Resolve current absolute path
+            src = self.abspath_for(fn, status if self.group_images else None)
+            if not os.path.exists(src):
+                # Skip missing files silently; they may be logged by sync separately
+                continue
+            # Ensure unique destination name
+            dest = os.path.join(out_dir, fn)
+            base, ext = os.path.splitext(dest)
+            i = 1
+            final_dest = dest
+            while os.path.exists(final_dest):
+                final_dest = f"{base} ({i}){ext}"
+                i += 1
+            try:
+                os.makedirs(os.path.dirname(final_dest), exist_ok=True)
+                shutil.move(src, final_dest)
+                moved += 1
+                moved_names.append(fn)
+                if w_csv:
+                    w_csv.writerow([src, final_dest])
+            except Exception:
+                # Ignore move errors for individual files
+                pass
+
+        if f_csv:
+            try:
+                f_csv.close()
+            except Exception:
+                pass
+
+        # Remove moved records from DB
+        if moved_names:
+            with self.connect() as conn:
+                cur = conn.cursor()
+                cur.executemany(
+                    "DELETE FROM images WHERE filename = ?",
+                    [(name,) for name in moved_names],
+                )
+                conn.commit()
+
+        return moved

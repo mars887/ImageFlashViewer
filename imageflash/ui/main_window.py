@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 import sys
 import subprocess
+import shutil
 from typing import Optional
 
-from PySide6.QtCore import Qt, QSize, Signal, Slot, QEvent
+from PySide6.QtCore import Qt, QSize, Signal, Slot, QEvent, QPoint
 from PySide6.QtGui import QAction, QKeySequence, QKeyEvent
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -13,6 +14,8 @@ from PySide6.QtWidgets import (
     QSplitter,
     QMessageBox,
     QStackedWidget,
+    QMenu,
+    QFileDialog,
 )
 from PySide6.QtGui import QShortcut
 
@@ -94,6 +97,8 @@ class MainWindow(QMainWindow):
         self.sidebar.showInfoResToggled.connect(self.on_show_info_res_toggled)
         self.sidebar.showInfoSizeToggled.connect(self.on_show_info_size_toggled)
         self.sidebar.showInfoFmtToggled.connect(self.on_show_info_fmt_toggled)
+        self.sidebar.exportStatusTo.connect(self.on_export_status_to)
+        self.sidebar.deleteNegativeRequested.connect(self.on_delete_negative_requested)
         self.store.currentChanged.connect(self.on_current_changed)
         self.store.statsChanged.connect(self.sidebar.update_stats)
 
@@ -102,6 +107,7 @@ class MainWindow(QMainWindow):
         self.grid_view.requestRescale.connect(self._refresh_grid_page)
         self.grid_view.cellMarkRequested.connect(self.on_grid_cell_mark)
         self.grid_view.openExternalRequested.connect(self.on_grid_open_external)
+        self.grid_view.contextMenuRequested.connect(self.on_grid_context_menu)
 
         # Grid shortcuts
         self._setup_grid_shortcuts()
@@ -226,6 +232,29 @@ class MainWindow(QMainWindow):
                 self._refresh_current_image()
                 self._preload_neighbors()
 
+    @Slot(int, str)
+    def on_export_status_to(self, status: int, out_dir: str) -> None:
+        if not self.repo:
+            return
+        moved = 0
+        try:
+            moved = self.repo.export_move_by_status(status, out_dir)
+        except Exception:
+            moved = 0
+        # Reload records from DB after changes
+        try:
+            records = self.repo.get_all_records()
+            self.store.load_records(records)
+            self._apply_view_mode()
+        except Exception:
+            pass
+        # Notify
+        try:
+            name = "positive" if status > 0 else ("negative" if status < 0 else "unfiltered")
+            QMessageBox.information(self, "Export", f"Moved {moved} {name} image(s).")
+        except Exception:
+            pass
+
     @Slot()
     def on_mark(self, status: int) -> None:
         if self.repo is None:
@@ -251,6 +280,27 @@ class MainWindow(QMainWindow):
                     self.store.next()
                 self._refresh_current_image()
                 self._preload_neighbors()
+
+    @Slot()
+    def on_delete_negative_requested(self) -> None:
+        if not self.repo:
+            return
+        count = 0
+        try:
+            count = self.repo.delete_negative()
+        except Exception:
+            count = 0
+        # Reload after deletion
+        try:
+            records = self.repo.get_all_records()
+            self.store.load_records(records)
+            self._apply_view_mode()
+        except Exception:
+            pass
+        try:
+            QMessageBox.information(self, "Delete Negative", f"Deleted {count} negative image(s).")
+        except Exception:
+            pass
 
     @Slot(int, int)
     def on_current_changed(self, index: int, status: int) -> None:
@@ -453,6 +503,44 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    @Slot(int, QPoint)
+    def on_grid_context_menu(self, global_index: int, global_pos) -> None:
+        if not self.repo:
+            return
+        rec = self.store.record_at(global_index)
+        if not rec:
+            return
+        menu = QMenu(self)
+        act_copy = menu.addAction("Скопировать файл в…")
+        chosen = menu.exec(global_pos)
+        if chosen == act_copy:
+            try:
+                self._copy_file_of_index(global_index)
+            except Exception:
+                pass
+
+    def _copy_file_of_index(self, index: int) -> None:
+        if not self.repo:
+            return
+        rec = self.store.record_at(index)
+        if not rec:
+            return
+        src = self.repo.abspath_for(rec['filename'], rec.get('status'))
+        base = os.path.basename(src)
+        dest_path, _ = QFileDialog.getSaveFileName(self, "Сохранить копию", os.path.join(self.repo.folder, base), "All Files (*)")
+        if not dest_path:
+            return
+        if os.path.isdir(dest_path):
+            dest_path = os.path.join(dest_path, base)
+        if os.path.exists(dest_path):
+            resp = QMessageBox.question(self, "Перезаписать файл?", f"Файл уже существует:\n{dest_path}\nПерезаписать?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if resp != QMessageBox.Yes:
+                return
+        try:
+            shutil.copy2(src, dest_path)
+        except Exception as e:
+            QMessageBox.warning(self, "Ошибка копирования", f"Не удалось скопировать файл:\n{e}")
+
     @Slot(bool)
     def on_show_paths_toggled(self, show: bool) -> None:
         self._show_paths = show
@@ -540,22 +628,22 @@ class MainWindow(QMainWindow):
                 self._preload_neighbors()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
-        if event.key() == Qt.Key_Shift and not event.isAutoRepeat():
-            # Toggle show paths
-            self._show_paths = not self._show_paths
-            self.sidebar.set_show_paths(self._show_paths)
-            # Apply state
-            if self._is_grid_mode():
-                self.grid_view.set_show_paths(self._show_paths)
-            else:
-                if self._show_paths and self.repo:
-                    rec = self.store.current_record()
-                    if rec:
-                        path = self.repo.abspath_for(rec['filename'], rec.get('status'))
-                        rel = os.path.relpath(path, self.repo.folder)
-                        self.viewer.set_path_text(rel)
-                else:
-                    self.viewer.set_path_text(None)
+        # if event.key() == Qt.Key_Shift and not event.isAutoRepeat():
+        #     # Toggle show paths
+        #     self._show_paths = not self._show_paths
+        #     self.sidebar.set_show_paths(self._show_paths)
+        #     # Apply state
+        #     if self._is_grid_mode():
+        #         self.grid_view.set_show_paths(self._show_paths)
+        #     else:
+        #         if self._show_paths and self.repo:
+        #             rec = self.store.current_record()
+        #             if rec:
+        #                 path = self.repo.abspath_for(rec['filename'], rec.get('status'))
+        #                 rel = os.path.relpath(path, self.repo.folder)
+        #                 self.viewer.set_path_text(rel)
+        #         else:
+        #             self.viewer.set_path_text(None)
         if event.key() in CONFIG.hotkeys.overlay_hold_keys:
             if not self._del_held:
                 self._del_held = True
@@ -595,7 +683,6 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event: QKeyEvent) -> None:  # noqa: N802
-        # No action on Shift release; it's a toggle now
         if event.key() in (CONFIG.hotkeys.sign_plus_keys + CONFIG.hotkeys.sign_minus_keys + CONFIG.hotkeys.sign_clear_keys):
             self._sign_mode = None
             if event.key() in CONFIG.hotkeys.sign_minus_keys:

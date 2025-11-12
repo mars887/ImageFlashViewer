@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QSlider,
     QCheckBox,
+    QMenu,
 )
 from ..config import CONFIG
 
@@ -34,6 +35,8 @@ class SideBar(QWidget):
     showInfoResToggled = Signal(bool)
     showInfoSizeToggled = Signal(bool)
     showInfoFmtToggled = Signal(bool)
+    exportStatusTo = Signal(int, str)  # status, out_dir
+    deleteNegativeRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -63,6 +66,7 @@ class SideBar(QWidget):
         self.chk_info_size = QCheckBox("Size")
         self.chk_info_fmt = QCheckBox("Fmt")
         self.btn_jump_first = QPushButton("К первому непроверенному")
+        self.btn_database = QPushButton("database")
 
         self._build_ui()
         self._connect()
@@ -106,6 +110,7 @@ class SideBar(QWidget):
         layout.addLayout(self.info_row)
         layout.addStretch(1)
         layout.addWidget(self.btn_jump_first)
+        layout.addWidget(self.btn_database)
 
         self.setMinimumWidth(360)
 
@@ -124,6 +129,8 @@ class SideBar(QWidget):
         # Default states
         self._set_info_children_visible(False)
         self.chk_info_res.setChecked(True)
+        # Build database menu
+        self._build_database_menu()
 
     def _choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Выбор папки с изображениями")
@@ -179,3 +186,24 @@ class SideBar(QWidget):
     def _on_info_master_toggled(self, show: bool) -> None:
         self._set_info_children_visible(show)
         self.showResolutionToggled.emit(show)
+
+    # Database menu and actions
+    def _build_database_menu(self) -> None:
+        self.database_menu = QMenu(self)
+        act_pos = self.database_menu.addAction("export positive images to")
+        act_neg = self.database_menu.addAction("export negative images to")
+        self.database_menu.addSeparator()
+        act_del = self.database_menu.addAction("delete negative images")
+
+        act_pos.triggered.connect(lambda: self._on_export_click(+1))
+        act_neg.triggered.connect(lambda: self._on_export_click(-1))
+        act_del.triggered.connect(self.deleteNegativeRequested.emit)
+
+        # Attach menu to the button so it opens on click
+        self.btn_database.setMenu(self.database_menu)
+
+    def _on_export_click(self, status: int) -> None:
+        caption = "Choose export folder"
+        out_dir = QFileDialog.getExistingDirectory(self, caption)
+        if out_dir:
+            self.exportStatusTo.emit(status, out_dir)

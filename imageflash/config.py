@@ -14,17 +14,17 @@ from PySide6.QtCore import Qt
 class Hotkeys:
     # QAction/QShortcut bindings (QKeySequence strings). Multiple allowed per action.
     toggle_fullscreen: list[str] = field(default_factory=lambda: ["F11"], metadata={"desc": "Toggle full screen view."})
-    prev: list[str] = field(default_factory=lambda: ["Left"], metadata={"desc": "Previous image or previous grid page."})
-    next: list[str] = field(default_factory=lambda: ["Right"], metadata={"desc": "Next image or next grid page."})
-    mark_positive: list[str] = field(default_factory=lambda: ["Up"], metadata={"desc": "Mark current image positive; in grid mode, mark unreviewed positive on page."})
-    mark_negative: list[str] = field(default_factory=lambda: ["Down"], metadata={"desc": "Mark current image negative; in grid mode, mark unreviewed negative on page."})
+    prev: list[str] = field(default_factory=lambda: ["Left","A"], metadata={"desc": "Previous image or previous grid page."})
+    next: list[str] = field(default_factory=lambda: ["Right","D"], metadata={"desc": "Next image or next grid page."})
+    mark_positive: list[str] = field(default_factory=lambda: ["Up","W"], metadata={"desc": "Mark current image positive; in grid mode, mark unreviewed positive on page."})
+    mark_negative: list[str] = field(default_factory=lambda: ["Down","S"], metadata={"desc": "Mark current image negative; in grid mode, mark unreviewed negative on page."})
     grid_mark_negative_batch: list[str] = field(default_factory=lambda: ["/"], metadata={"desc": "Batch negative: mark unreviewed (or all) on page negative."})
     grid_mark_positive_batch: list[str] = field(default_factory=lambda: ["*"], metadata={"desc": "Batch positive: mark unreviewed (or all) on page positive."})
     grid_next_page: list[str] = field(default_factory=lambda: ["Return", "Enter"], metadata={"desc": "Advance grid to next page."})
     grid_prefill_next_positive: list[str] = field(default_factory=lambda: ["Space"], metadata={"desc": "On grid: Space marks unreviewed cells positive; if '+' held, mark all positive; if '-' held, mark all negative."})
 
     # event.key() comparisons (Qt key enums). Multiple allowed per action.
-    overlay_hold_keys: list[int] = field(default_factory=lambda: [Qt.Key_Delete, Qt.Key_Period, Qt.Key_Comma], metadata={"desc": "While held, show spotlight overlay."})
+    overlay_hold_keys: list[int] = field(default_factory=lambda: [Qt.Key_Delete, Qt.Key_Period, Qt.Key_Comma, Qt.Key_Alt], metadata={"desc": "While held, show spotlight overlay."})
     sign_plus_keys: list[int] = field(default_factory=lambda: [Qt.Key_Plus], metadata={"desc": "When held with digit, set cell to positive."})
     sign_minus_keys: list[int] = field(default_factory=lambda: [Qt.Key_Minus], metadata={"desc": "When held with digit, set cell to negative."})
     sign_clear_keys: list[int] = field(default_factory=lambda: [Qt.Key_0, Qt.Key_Insert], metadata={"desc": "When held with digit, clear cell (status 0)."})

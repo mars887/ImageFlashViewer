@@ -82,7 +82,7 @@ class ViewSingleWidget(QWidget):
             color = QColor(*CONFIG.stripe_positive_color) if self._status > 0 else QColor(*CONFIG.stripe_negative_color)
             painter.fillRect(0, self.height() - stripe_h, self.width(), stripe_h, color)
 
-        # Path label when requested (e.g., Shift held)
+        # Path label when requested
         if self._path_text:
             fm = painter.fontMetrics()
             pad_x = 8

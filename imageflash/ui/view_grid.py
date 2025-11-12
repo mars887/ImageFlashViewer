@@ -20,6 +20,7 @@ class ViewGridWidget(QWidget):
     requestRescale = Signal()
     cellMarkRequested = Signal(int, int)  # global_index, new_status
     openExternalRequested = Signal(int)  # global_index
+    contextMenuRequested = Signal(int, QPoint)  # global_index, global position
 
     def __init__(self) -> None:
         super().__init__()
@@ -282,10 +283,13 @@ class ViewGridWidget(QWidget):
                             cursor_x = badge.left() - gap
                 i += 1
 
-        # Overlay page badge (compact): "start–end of total"
+        # Overlay page badge (compact): "start–end of total | page of pages"
         if self._page_info:
             start, end, total = self._page_info
-            text = f"{start}\u2013{end} of {total}"
+            page_size = max(1, self._rows * self._cols)
+            total_pages = (total + page_size - 1) // page_size if total > 0 else 0
+            current_page = ((start - 1) // page_size) + 1 if total > 0 else 0
+            text = f"{start}\u2013{end} of {total} | {current_page} of {total_pages}"
             metrics_padding = 6
             fm = self.fontMetrics()
             tw = fm.horizontalAdvance(text) + metrics_padding * 2
@@ -351,7 +355,10 @@ class ViewGridWidget(QWidget):
                             new_status = 0 if cur == -1 else -1
                             self.cellMarkRequested.emit(int(item.get("index")), new_status)
                         elif event.button() == Qt.MiddleButton:
-                            self.openExternalRequested.emit(int(item.get("index")))
+                            if event.modifiers() & Qt.ShiftModifier:
+                                self.openExternalRequested.emit(int(item.get("index")))
+                            else:
+                                self.contextMenuRequested.emit(int(item.get("index")), event.globalPosition().toPoint())
                     return
                 i += 1
         super().mousePressEvent(event)
