@@ -4,6 +4,13 @@ from typing import Dict, List, Optional
 
 from PySide6.QtCore import QObject, Signal
 
+# Developer Notes (state/store.py)
+# - ImageStore holds in-memory records loaded from the repository and emits
+#   signals: currentChanged(index, status) and statsChanged(total, pos, neg, unreviewed).
+# - Provides linear navigation and page-based navigation helpers for grid mode.
+# - mark_status()/mark_status_at() persist via the repo and update local state.
+# - The current index is treated as the single-view image and top-left of grid.
+
 
 class ImageStore(QObject):
     currentChanged = Signal(int, int)  # index, status
@@ -133,10 +140,8 @@ class ImageStore(QObject):
             rec["status"] = status
             # Update signals as needed
             if index == self._index:
+                # Only emit currentChanged when the top-left/current index itself changed
                 self._emit_current()
-            else:
-                # Still emit to refresh status stripe if single mode is on another index
-                self.currentChanged.emit(self._index, self.current_record().get("status", 0) if self.current_record() else 0)
             self._emit_stats()
         return ok
 

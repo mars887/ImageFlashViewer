@@ -7,6 +7,12 @@ from PySide6.QtGui import QPainter, QColor, QImage, QPixmap
 from PySide6.QtWidgets import QWidget
 from ..config import CONFIG
 
+# Developer Notes (ui/overlay.py)
+# - Fullscreen overlay for “spotlight” preview. Non-interactive; draws a dim
+#   background and centers a scaled image with margins. Optional footer shows
+#   relative path, file size and image dimensions.
+# - Set via set_image() and set_footer(); the main window controls visibility.
+
 
 class OverlayWidget(QWidget):
     def __init__(self, parent=None) -> None:
@@ -15,9 +21,14 @@ class OverlayWidget(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setVisible(False)
+        self._footer: Optional[str] = None
 
     def set_image(self, image: Optional[QImage]) -> None:
         self._image = image
+        self.update()
+
+    def set_footer(self, text: Optional[str]) -> None:
+        self._footer = text
         self.update()
 
     def viewport_size(self) -> Tuple[int, int]:
@@ -49,3 +60,14 @@ class OverlayWidget(QWidget):
         y = (self.height() - pm.height()) // 2
         p.drawPixmap(x, y, pm)
 
+        # Footer info bar
+        if self._footer:
+            fm = p.fontMetrics()
+            pad_x = 12
+            pad_y = 6
+            bar_h = fm.height() + pad_y * 2
+            rect = self.rect().adjusted(0, self.height() - bar_h, 0, 0)
+            p.fillRect(rect, QColor(0, 0, 0, 180))
+            p.setPen(QColor(235, 235, 235))
+            text = fm.elidedText(self._footer, Qt.ElideMiddle, self.width() - pad_x * 2)
+            p.drawText(rect.adjusted(pad_x, 0, -pad_x, 0), Qt.AlignVCenter | Qt.AlignLeft, text)

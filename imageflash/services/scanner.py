@@ -6,6 +6,12 @@ from typing import Iterable, List
 
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
+# Developer Notes (services/scanner.py)
+# - Scans a single folder for supported image extensions. In grouped mode it
+#   also scans positive/unfiltered/negative subfolders and top-level images.
+# - Returns basenames only (no directories), sorted and de-duplicated.
+# - Keep SUPPORTED_EXT in sync with formats you want to allow.
+
 
 def is_image_file(path: str) -> bool:
     _, ext = os.path.splitext(path)

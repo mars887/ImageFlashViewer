@@ -5,6 +5,15 @@ from imageflash.data.repo import SQLiteRepository
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QCoreApplication
 
+# Developer Notes (app.py)
+# - This is the application entrypoint. It parses CLI flags for export/delete
+#   operations and, when none are provided, starts the Qt GUI.
+# - CLI path: construct SQLiteRepository using --folder and perform export
+#   (status or lists) or bulk deletion of negatives.
+# - GUI path: creates QApplication, instantiates MainWindow, and shows it
+#   fullscreen by default. The --group_images flag is passed through.
+# - Extend here when adding additional headless commands or environment setup.
+
 
 def _parse_bool(val: str) -> bool:
     v = str(val).strip().lower()
@@ -18,7 +27,6 @@ def main():
     parser.add_argument("--export_format", type=str, choices=["json", "csv"], help="Export format", default="csv")
     parser.add_argument("--export_directory", type=str, help="Output directory (default: image folder)", default=None)
     parser.add_argument("--group_images", type=str, help="Group files into positive/unfiltered/negative and move on change (true/false)", default="false")
-    parser.add_argument("--delete_negaive", action="store_true", help="Delete all negative images (alias)")
     parser.add_argument("--delete_negative", action="store_true", help="Delete all negative images")
 
     args = parser.parse_args()
@@ -26,7 +34,7 @@ def main():
     group_images = _parse_bool(args.group_images)
 
     # Headless CLI operations if export or delete flags provided
-    if args.export or args.delete_negative or args.delete_negaive:
+    if args.export or args.delete_negative:
         if not args.folder:
             print("--folder is required for CLI operations", file=sys.stderr)
             sys.exit(2)
@@ -47,7 +55,7 @@ def main():
                 print(out)
                 sys.exit(0)
 
-        if args.delete_negative or args.delete_negaive:
+        if args.delete_negative:
             count = repo.delete_negative()
             print(count)
             sys.exit(0)

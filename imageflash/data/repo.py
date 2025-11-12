@@ -8,6 +8,16 @@ import sqlite3
 from datetime import datetime
 from typing import Iterable, List, Tuple, Dict, Optional
 
+# Developer Notes (data/repo.py)
+# - SQLiteRepository encapsulates DB access stored alongside images as
+#   .imageflash.sqlite. It owns schema init, folder sync, status updates,
+#   simple exports (CSV/JSON), grouping (moving files between subfolders),
+#   and deletion of negatives with a deleted.csv log.
+# - Filenames in DB are basenames only; use abspath_for() to resolve actual
+#   paths, especially in grouping mode. All operations are per-call connections
+#   (sqlite3.connect) with row_factory = Row.
+# - Exports write to the image folder by default unless an explicit output
+#   directory is provided.
 
 class SQLiteRepository:
     def __init__(self, folder: str, group_images: bool = False) -> None:

@@ -11,12 +11,24 @@ from PySide6.QtWidgets import (
     QLabel,
     QFileDialog,
     QSlider,
+    QCheckBox,
 )
+
+# Developer Notes (ui/sidebar.py)
+# - Left-hand settings panel. Emits:
+#   * folderSelected(str) when a folder is chosen/entered
+#   * gridSizeChanged(cols, rows) for grid dimensions (1..3)
+#   * showPathsToggled(bool) to toggle per-image path labels
+#   * jumpToFirstUnreviewed() to navigate to first unreviewed item
+# - Update labels via update_stats(); use set_grid_size() and set_show_paths()
+#   to reflect external state changes.
 
 
 class SideBar(QWidget):
     folderSelected = Signal(str)
     gridSizeChanged = Signal(int, int)  # cols, rows
+    showPathsToggled = Signal(bool)
+    jumpToFirstUnreviewed = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -39,6 +51,9 @@ class SideBar(QWidget):
         self.grid_rows_slider.setRange(1, 3)
         self.grid_rows_slider.setValue(1)
         self.grid_rows_label = QLabel("Строки: 1")
+
+        self.chk_show_paths = QCheckBox("Показывать пути")
+        self.btn_jump_first = QPushButton("К первому непроверенному")
 
         self._build_ui()
         self._connect()
@@ -65,7 +80,10 @@ class SideBar(QWidget):
         layout.addWidget(self.grid_cols_slider)
         layout.addWidget(self.grid_rows_label)
         layout.addWidget(self.grid_rows_slider)
+        layout.addSpacing(12)
+        layout.addWidget(self.chk_show_paths)
         layout.addStretch(1)
+        layout.addWidget(self.btn_jump_first)
 
         self.setMinimumWidth(360)
 
@@ -74,6 +92,8 @@ class SideBar(QWidget):
         self.path_edit.returnPressed.connect(self._emit_folder)
         self.grid_cols_slider.valueChanged.connect(self._grid_value_changed)
         self.grid_rows_slider.valueChanged.connect(self._grid_value_changed)
+        self.chk_show_paths.toggled.connect(self.showPathsToggled.emit)
+        self.btn_jump_first.clicked.connect(self.jumpToFirstUnreviewed.emit)
 
     def _choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Выбор папки с изображениями")
@@ -104,3 +124,6 @@ class SideBar(QWidget):
         self.grid_rows_slider.setValue(rows)
         self.grid_cols_label.setText(f"Колонки: {cols}")
         self.grid_rows_label.setText(f"Строки: {rows}")
+
+    def set_show_paths(self, show: bool) -> None:
+        self.chk_show_paths.setChecked(show)

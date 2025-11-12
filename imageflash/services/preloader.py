@@ -7,6 +7,13 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt
 from PySide6.QtGui import QImage
 from ..config import CONFIG
 
+# Developer Notes (services/preloader.py)
+# - Threaded image loading/caching. Uses QThreadPool + QRunnable workers and an
+#   in-memory LRU keyed by (path, snapped_size). Call request(path, size, cb)
+#   from the UI; callback will be invoked on the main thread via Qt signals.
+# - _normalize_size snaps requested size to reduce cache fragmentation.
+# - Cache size is controlled by CONFIG.preloader_max_items.
+
 
 def _normalize_size(size: Tuple[int, int]) -> Tuple[int, int]:
     # Reduce cache fragmentation by snapping to 64px grid

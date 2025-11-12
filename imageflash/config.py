@@ -3,6 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from PySide6.QtCore import Qt
 
+# Developer Notes (config.py)
+# - Central configuration for the app. Includes visual styling, preloader
+#   settings and the Hotkeys dataclass used by the UI for bindings.
+# - QAction/QShortcut bindings are configured as QKeySequence strings, while
+#   low-level key handling (event.key()) uses Qt.Key enums.
+# - Adjust values here to tweak cache sizes, preload radius, colors and keymaps.
+
 @dataclass
 class Hotkeys:
     # QAction/QShortcut bindings (QKeySequence strings). Multiple allowed per action.
@@ -17,10 +24,10 @@ class Hotkeys:
     grid_prefill_next_positive: list[str] = field(default_factory=lambda: ["Space"], metadata={"desc": "On grid: Space marks unreviewed cells positive; if '+' held, mark all positive; if '-' held, mark all negative."})
 
     # event.key() comparisons (Qt key enums). Multiple allowed per action.
-    overlay_hold_keys: list[int] = field(default_factory=lambda: [Qt.Key_Delete, Qt.Key_Period], metadata={"desc": "While held, show spotlight overlay."})
+    overlay_hold_keys: list[int] = field(default_factory=lambda: [Qt.Key_Delete, Qt.Key_Period, Qt.Key_Comma], metadata={"desc": "While held, show spotlight overlay."})
     sign_plus_keys: list[int] = field(default_factory=lambda: [Qt.Key_Plus], metadata={"desc": "When held with digit, set cell to positive."})
     sign_minus_keys: list[int] = field(default_factory=lambda: [Qt.Key_Minus], metadata={"desc": "When held with digit, set cell to negative."})
-    sign_clear_keys: list[int] = field(default_factory=lambda: [Qt.Key_0,Qt.Key_Insert], metadata={"desc": "When held with digit, clear cell (status 0)."})
+    sign_clear_keys: list[int] = field(default_factory=lambda: [Qt.Key_0, Qt.Key_Insert], metadata={"desc": "When held with digit, clear cell (status 0)."})
     grid_digit_keys: list[int] = field(default_factory=lambda: [
         Qt.Key_1, Qt.Key_2, Qt.Key_3,
         Qt.Key_4, Qt.Key_5, Qt.Key_6,

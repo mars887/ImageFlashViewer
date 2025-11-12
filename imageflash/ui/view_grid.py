@@ -7,6 +7,14 @@ from PySide6.QtGui import QPainter, QColor, QImage, QPixmap, QMouseEvent
 from PySide6.QtWidgets import QWidget
 from ..config import CONFIG
 
+# Developer Notes (ui/view_grid.py)
+# - Renders a grid of tiles (rows x cols) and requests tile-sized images via
+#   a preloader callback. Each tile can show a status stripe or a bottom path
+#   bar with an embedded status segment.
+# - Emits cellMarkRequested(global_index, new_status) when tiles are clicked.
+#   index_at_point(pt) maps mouse position to a global index.
+# - A compact page badge (start–end of total) is drawn in the top-left.
+
 
 class ViewGridWidget(QWidget):
     requestRescale = Signal()
@@ -22,6 +30,7 @@ class ViewGridWidget(QWidget):
         self._page_info: Optional[Tuple[int, int, int]] = None  # start,end,total
         self.setMinimumSize(200, 200)
         self.setMouseTracking(True)
+        self._show_paths: bool = False
 
     def set_request_image(self, fn) -> None:
         self._request_image = fn
@@ -64,6 +73,11 @@ class ViewGridWidget(QWidget):
     def set_page_info(self, start: int, end: int, total: int) -> None:
         self._page_info = (start, end, total)
         self.update()
+
+    def set_show_paths(self, show: bool) -> None:
+        if self._show_paths != show:
+            self._show_paths = show
+            self.update()
 
     def update_item_status(self, global_index: int, status: int) -> None:
         for it in self._items:
@@ -109,9 +123,9 @@ class ViewGridWidget(QWidget):
                         x = rect.x() + (rect.width() - pm.width()) // 2
                         y = rect.y() + (rect.height() - pm.height()) // 2
                         p.drawPixmap(x, y, pm)
-                    # Status stripe
+                    # Status stripe (only when not showing path bar)
                     st = int(item.get("status", 0))
-                    if st != 0:
+                    if st != 0 and not self._show_paths:
                         stripe_h = CONFIG.grid_status_stripe_height
                         color = QColor(*CONFIG.stripe_positive_color) if st > 0 else QColor(*CONFIG.stripe_negative_color)
                         p.fillRect(rect.x(), rect.y() + rect.height() - stripe_h, rect.width(), stripe_h, color)
@@ -133,6 +147,37 @@ class ViewGridWidget(QWidget):
             p.fillRect(rect, QColor(0, 0, 0, 140))
             p.setPen(QColor(230, 230, 230))
             p.drawText(rect.adjusted(metrics_padding, 0, -metrics_padding, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
+
+        # If showing paths, draw under each tile
+        if self._show_paths:
+            i = 0
+            fm = self.fontMetrics()
+            pad_x = 6
+            pad_y = 2
+            for rr in range(self._rows):
+                for cc in range(self._cols):
+                    if i < len(self._items):
+                        item = self._items[i]
+                        rect = self._tile_rect(rr, cc)
+                        # Background bar
+                        bar_h = fm.height() + pad_y * 2
+                        bar_rect = QRect(rect.x(), rect.y() + rect.height() - bar_h, rect.width(), bar_h)
+                        p.fillRect(bar_rect, QColor(0, 0, 0, 150))
+                        # Status segment (10% width of bar)
+                        st = int(item.get("status", 0))
+                        if st != 0:
+                            seg_w = max(6, int(bar_rect.width() * 0.20))
+                            seg_rect = QRect(bar_rect.right() - seg_w + 1, bar_rect.y(), seg_w, bar_rect.height())
+                            base_col = QColor(*CONFIG.stripe_positive_color) if st > 0 else QColor(*CONFIG.stripe_negative_color)
+                            col = QColor(base_col.red(), base_col.green(), base_col.blue(), int(255 * 0.8))
+                            p.fillRect(seg_rect, col)
+                        # Text: relative path occupying ~90%
+                        text_width = bar_rect.width() - pad_x * 2 - max(0, int(bar_rect.width() * 0.20))
+                        rel = item.get("rel") or item.get("path", "")
+                        text = fm.elidedText(rel, Qt.ElideMiddle, max(10, text_width))
+                        p.setPen(QColor(235, 235, 235))
+                        p.drawText(bar_rect.adjusted(pad_x, 0, -pad_x - max(0, int(bar_rect.width() * 0.20)), 0), Qt.AlignVCenter | Qt.AlignLeft, text)
+                    i += 1
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         self.requestRescale.emit()

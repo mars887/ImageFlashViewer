@@ -23,6 +23,17 @@ from .view_single import ViewSingleWidget
 from .view_grid import ViewGridWidget
 from ..config import CONFIG
 from .overlay import OverlayWidget
+from PySide6.QtGui import QImageReader
+
+# Developer Notes (ui/main_window.py)
+# - MainWindow orchestrates the UI: sidebar, single viewer, grid view and
+#   overlay. It wires hotkeys, navigation, marking, grouping moves, preloading,
+#   and optional path labels. Grid size is controlled via sidebar sliders.
+# - Grid mode: per-tile clicks mark individual statuses; batch operations via
+#   shortkeys; Enter/Left/Right page navigation; Space prefill next page.
+# - Overlay: hold overlay key(s) to preview under cursor; footer shows
+#   path/file size/dimensions; numpad targeting supported while overlay is held.
+# - Keep long operations off the GUI thread; use preloader for image IO.
 
 
 class MainWindow(QMainWindow):
@@ -42,6 +53,7 @@ class MainWindow(QMainWindow):
         self._overlay_forced_index = None  # type: Optional[int]
         self._is_minus_held = False
         self._is_clear_held = False
+        self._show_paths = False
 
         # UI setup
         self.sidebar = SideBar()
@@ -67,6 +79,8 @@ class MainWindow(QMainWindow):
         # Wiring
         self.sidebar.folderSelected.connect(self.on_folder_selected)
         self.sidebar.gridSizeChanged.connect(self.on_grid_size_changed)
+        self.sidebar.showPathsToggled.connect(self.on_show_paths_toggled)
+        self.sidebar.jumpToFirstUnreviewed.connect(self.on_jump_to_first_unreviewed)
         self.store.currentChanged.connect(self.on_current_changed)
         self.store.statsChanged.connect(self.sidebar.update_stats)
 
@@ -207,6 +221,15 @@ class MainWindow(QMainWindow):
             self._refresh_grid_page()
         else:
             self.viewer.set_status(status)
+            # Update path overlay if showing paths
+            if self._show_paths and self.repo:
+                rec = self.store.current_record()
+                if rec:
+                    path = self.repo.abspath_for(rec['filename'], rec.get('status'))
+                    rel = os.path.relpath(path, self.repo.folder)
+                    self.viewer.set_path_text(rel)
+            else:
+                self.viewer.set_path_text(None)
 
     def _current_file_abspath(self) -> Optional[str]:
         rec = self.store.current_record()
@@ -303,13 +326,15 @@ class MainWindow(QMainWindow):
         for offset, rec in enumerate(recs):
             idx = base_index + offset
             path = self.repo.abspath_for(rec['filename'], rec.get('status'))
-            items.append({"index": idx, "path": path, "status": rec.get('status', 0)})
+            rel = os.path.relpath(path, self.repo.folder)
+            items.append({"index": idx, "path": path, "status": rec.get('status', 0), "rel": rel})
         self.grid_view.set_items(items)
         # Badge info
         total = len(self.store.records())
         start = base_index + 1 if total > 0 else 0
         end = base_index + len(recs)
         self.grid_view.set_page_info(start, end, total)
+        self.grid_view.set_show_paths(self._show_paths)
 
     @Slot(int, int)
     def on_grid_cell_mark(self, global_index: int, new_status: int) -> None:
@@ -344,6 +369,21 @@ class MainWindow(QMainWindow):
                         pass
         self._refresh_grid_page()
 
+    @Slot(bool)
+    def on_show_paths_toggled(self, show: bool) -> None:
+        self._show_paths = show
+        if self._is_grid_mode():
+            self.grid_view.set_show_paths(show)
+        else:
+            if show and self.repo:
+                rec = self.store.current_record()
+                if rec:
+                    path = self.repo.abspath_for(rec['filename'], rec.get('status'))
+                    rel = os.path.relpath(path, self.repo.folder)
+                    self.viewer.set_path_text(rel)
+            else:
+                self.viewer.set_path_text(None)
+
     @Slot()
     def on_grid_next_page(self) -> None:
         if self.store.next_page(self.grid_rows, self.grid_cols):
@@ -356,7 +396,45 @@ class MainWindow(QMainWindow):
         any_unreviewed = any(int(r.get('status', 0)) == 0 for r in recs)
         self._grid_mark_all(status, only_unreviewed=any_unreviewed)
 
+    @Slot()
+    def on_jump_to_first_unreviewed(self) -> None:
+        # Find first record with status == 0 from the beginning
+        records = self.store.records()
+        target_index = -1
+        for i, rec in enumerate(records):
+            if int(rec.get('status', 0)) == 0:
+                target_index = i
+                break
+        if target_index < 0:
+            return
+        # In grid mode, snap to the start of the page containing target_index
+        if self._is_grid_mode():
+            page_size = max(1, self.grid_rows * self.grid_cols)
+            page_start = (target_index // page_size) * page_size
+            if self.store.set_index(page_start):
+                self._refresh_grid_page()
+        else:
+            if self.store.set_index(target_index):
+                self._refresh_current_image()
+                self._preload_neighbors()
+
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if event.key() == Qt.Key_Shift and not event.isAutoRepeat():
+            # Toggle show paths
+            self._show_paths = not self._show_paths
+            self.sidebar.set_show_paths(self._show_paths)
+            # Apply state
+            if self._is_grid_mode():
+                self.grid_view.set_show_paths(self._show_paths)
+            else:
+                if self._show_paths and self.repo:
+                    rec = self.store.current_record()
+                    if rec:
+                        path = self.repo.abspath_for(rec['filename'], rec.get('status'))
+                        rel = os.path.relpath(path, self.repo.folder)
+                        self.viewer.set_path_text(rel)
+                else:
+                    self.viewer.set_path_text(None)
         if event.key() in CONFIG.hotkeys.overlay_hold_keys:
             if not self._del_held:
                 self._del_held = True
@@ -396,6 +474,7 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        # No action on Shift release; it's a toggle now
         if event.key() in (CONFIG.hotkeys.sign_plus_keys + CONFIG.hotkeys.sign_minus_keys + CONFIG.hotkeys.sign_clear_keys):
             self._sign_mode = None
             if event.key() in CONFIG.hotkeys.sign_minus_keys:
@@ -485,14 +564,70 @@ class MainWindow(QMainWindow):
                 rec = self.store.record_at(idx)
                 if rec:
                     target_path = self.repo.abspath_for(rec['filename'], rec.get('status'))
+                    rel = os.path.relpath(target_path, self.repo.folder)
+                    # Prepare footer: relative path • file size • WxH
+                    size_text = ""
+                    try:
+                        size_bytes = os.path.getsize(target_path)
+                        size_text = self._format_bytes(size_bytes)
+                    except Exception:
+                        size_text = "?"
+                    wh_text = ""
+                    try:
+                        reader = QImageReader(target_path)
+                        sz = reader.size()
+                        if sz.isValid():
+                            wh_text = f"{sz.width()}x{sz.height()}"
+                    except Exception:
+                        wh_text = ""
+                    footer = f"{rel}"
+                    if size_text:
+                        footer += f" • {size_text}"
+                    if wh_text:
+                        footer += f" • {wh_text}"
+                    self.overlay.set_footer(footer)
         else:
             rec = self.store.current_record()
             if rec:
                 target_path = self.repo.abspath_for(rec['filename'], rec.get('status'))
+                rel = os.path.relpath(target_path, self.repo.folder)
+                size_text = ""
+                try:
+                    size_bytes = os.path.getsize(target_path)
+                    size_text = self._format_bytes(size_bytes)
+                except Exception:
+                    size_text = "?"
+                wh_text = ""
+                try:
+                    reader = QImageReader(target_path)
+                    sz = reader.size()
+                    if sz.isValid():
+                        wh_text = f"{sz.width()}x{sz.height()}"
+                except Exception:
+                    wh_text = ""
+                footer = f"{rel}"
+                if size_text:
+                    footer += f" • {size_text}"
+                if wh_text:
+                    footer += f" • {wh_text}"
+                self.overlay.set_footer(footer)
         if not target_path:
             self.overlay.set_image(None)
+            self.overlay.set_footer(None)
             return
         self.preloader.request(target_path, (vw, vh), self.overlay.set_image)
+
+    def _format_bytes(self, num: int) -> str:
+        units = ['B', 'KB', 'MB', 'GB', 'TB']
+        size = float(num)
+        for unit in units:
+            if size < 1024 or unit == units[-1]:
+                if unit == 'B':
+                    return f"{int(size)} {unit}"
+                else:
+                    return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{num} B"
 
     def _handle_numpad_digit(self, key: int) -> None:
         idx = self._index_for_numpad_key(key)
