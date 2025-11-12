@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QCheckBox,
 )
+from ..config import CONFIG
 
 # Developer Notes (ui/sidebar.py)
 # - Left-hand settings panel. Emits:
@@ -29,6 +30,10 @@ class SideBar(QWidget):
     gridSizeChanged = Signal(int, int)  # cols, rows
     showPathsToggled = Signal(bool)
     jumpToFirstUnreviewed = Signal()
+    showResolutionToggled = Signal(bool)  # acts as master 'info' toggle for compatibility
+    showInfoResToggled = Signal(bool)
+    showInfoSizeToggled = Signal(bool)
+    showInfoFmtToggled = Signal(bool)
 
     def __init__(self) -> None:
         super().__init__()
@@ -44,15 +49,19 @@ class SideBar(QWidget):
         # Grid controls
         self.grid_cols_slider = QSlider(Qt.Horizontal)
         self.grid_cols_slider.setRange(1, 3)
-        self.grid_cols_slider.setValue(1)
-        self.grid_cols_label = QLabel("Колонки: 1")
+        self.grid_cols_slider.setValue(CONFIG.grid_default_cols)
+        self.grid_cols_label = QLabel(f"Колонки: {CONFIG.grid_default_cols}")
 
         self.grid_rows_slider = QSlider(Qt.Horizontal)
         self.grid_rows_slider.setRange(1, 3)
-        self.grid_rows_slider.setValue(1)
-        self.grid_rows_label = QLabel("Строки: 1")
+        self.grid_rows_slider.setValue(CONFIG.grid_default_rows)
+        self.grid_rows_label = QLabel(f"Строки: {CONFIG.grid_default_rows}")
 
         self.chk_show_paths = QCheckBox("Показывать пути")
+        self.chk_show_res = QCheckBox("Информация")
+        self.chk_info_res = QCheckBox("Res")
+        self.chk_info_size = QCheckBox("Size")
+        self.chk_info_fmt = QCheckBox("Fmt")
         self.btn_jump_first = QPushButton("К первому непроверенному")
 
         self._build_ui()
@@ -81,7 +90,20 @@ class SideBar(QWidget):
         layout.addWidget(self.grid_rows_label)
         layout.addWidget(self.grid_rows_slider)
         layout.addSpacing(12)
-        layout.addWidget(self.chk_show_paths)
+        cb_row = QHBoxLayout()
+        cb_row.addWidget(self.chk_show_paths)
+        cb_row.addWidget(self.chk_show_res)
+        cb_row.addStretch(1)
+        layout.addLayout(cb_row)
+
+        # Info children row (hidden until master enabled)
+        self.info_row = QHBoxLayout()
+        self.info_row.addSpacing(16)
+        self.info_row.addWidget(self.chk_info_res)
+        self.info_row.addWidget(self.chk_info_size)
+        self.info_row.addWidget(self.chk_info_fmt)
+        self.info_row.addStretch(1)
+        layout.addLayout(self.info_row)
         layout.addStretch(1)
         layout.addWidget(self.btn_jump_first)
 
@@ -94,6 +116,14 @@ class SideBar(QWidget):
         self.grid_rows_slider.valueChanged.connect(self._grid_value_changed)
         self.chk_show_paths.toggled.connect(self.showPathsToggled.emit)
         self.btn_jump_first.clicked.connect(self.jumpToFirstUnreviewed.emit)
+        self.chk_show_res.toggled.connect(self._on_info_master_toggled)
+        self.chk_info_res.toggled.connect(self.showInfoResToggled.emit)
+        self.chk_info_size.toggled.connect(self.showInfoSizeToggled.emit)
+        self.chk_info_fmt.toggled.connect(self.showInfoFmtToggled.emit)
+
+        # Default states
+        self._set_info_children_visible(False)
+        self.chk_info_res.setChecked(True)
 
     def _choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Выбор папки с изображениями")
@@ -127,3 +157,25 @@ class SideBar(QWidget):
 
     def set_show_paths(self, show: bool) -> None:
         self.chk_show_paths.setChecked(show)
+
+    def set_show_resolution(self, show: bool) -> None:
+        # Backwards compat: treat as info master
+        self.chk_show_res.setChecked(show)
+        self._set_info_children_visible(show)
+
+    def set_info_res(self, show: bool) -> None:
+        self.chk_info_res.setChecked(show)
+
+    def set_info_size(self, show: bool) -> None:
+        self.chk_info_size.setChecked(show)
+
+    def set_info_fmt(self, show: bool) -> None:
+        self.chk_info_fmt.setChecked(show)
+
+    def _set_info_children_visible(self, vis: bool) -> None:
+        for w in (self.chk_info_res, self.chk_info_size, self.chk_info_fmt):
+            w.setVisible(vis)
+
+    def _on_info_master_toggled(self, show: bool) -> None:
+        self._set_info_children_visible(show)
+        self.showResolutionToggled.emit(show)

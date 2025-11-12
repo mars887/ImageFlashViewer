@@ -39,7 +39,7 @@ class Hotkeys:
 class Config:
     # Caching / preloading
     preloader_max_items: int = 400
-    preload_radius: int = 10
+    preload_radius: int = 30
 
     # UI styling
     background_color: tuple[int, int, int] = (18, 18, 18)
@@ -51,7 +51,10 @@ class Config:
     # Dimensions
     single_status_stripe_height: int = 10
     grid_status_stripe_height: int = 8
-    grid_tile_spacing: int = 6
+    grid_tile_spacing: int = 3
+    # Default grid size
+    grid_default_cols: int = 3
+    grid_default_rows: int = 2
 
     # Overlay
     overlay_margin: int = 32
@@ -59,6 +62,30 @@ class Config:
 
     # Hotkeys
     hotkeys: Hotkeys = field(default_factory=Hotkeys)
+
+    # Resolution badge thresholds and colors (mp_threshold, ms_threshold, hex_color)
+    # Ordered from highest to lowest quality; used in grid tile badge coloring.
+    resolution_badges: list[tuple[float, int, str]] = field(
+        default_factory=lambda: [
+            (32.0, 4000, "#FF33FF"),  # pink
+            (8.4, 2050, "#7777FF"),   # blue
+            (1.6, 1100, "#55FF55"),   # green
+            (0.7, 600, "#FFFF33"),    # yellow
+            (0.0, 0, "#FF7777"),      # red
+        ]
+    )
+    resolution_badge_alpha: int = 170
+    # File size badge thresholds (KB) and colors (hex)
+    size_badges: list[tuple[int, str]] = field(
+        default_factory=lambda: [
+            (4000, "#7777FF"),  # >=4MB ultra
+            (800, "#55FF55"),  # >=0.8MB good
+            (300, "#FFFF11"),   # >=300KB medium
+            (150, "#FF8888"),   # >=150KB low
+            (0, "#FF1111"),     # <200KB very low
+        ]
+    )
+    format_badge_color: str = "#B0B0B0"
 
 
 CONFIG = Config()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import sys
+import subprocess
 from typing import Optional
 
 from PySide6.QtCore import Qt, QSize, Signal, Slot, QEvent
@@ -46,14 +48,18 @@ class MainWindow(QMainWindow):
         self.store = ImageStore()
         self.preloader = ImagePreloader(CONFIG.preloader_max_items)
         self.group_images = group_images
-        self.grid_cols = 1
-        self.grid_rows = 1
+        self.grid_cols = CONFIG.grid_default_cols
+        self.grid_rows = CONFIG.grid_default_rows
         self._sign_mode = None  # type: Optional[int]
         self._del_held = False
         self._overlay_forced_index = None  # type: Optional[int]
         self._is_minus_held = False
         self._is_clear_held = False
         self._show_paths = False
+        self._show_info_master = False
+        self._show_info_res = False
+        self._show_info_size = False
+        self._show_info_fmt = False
 
         # UI setup
         self.sidebar = SideBar()
@@ -61,6 +67,9 @@ class MainWindow(QMainWindow):
         self.grid_view = ViewGridWidget()
         self.grid_view.set_request_image(self.preloader.request)
         self.overlay = OverlayWidget(self)
+        # Ensure viewers can take focus for keyboard navigation
+        self.viewer.setFocusPolicy(Qt.StrongFocus)
+        self.grid_view.setFocusPolicy(Qt.StrongFocus)
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self.viewer)
@@ -81,6 +90,10 @@ class MainWindow(QMainWindow):
         self.sidebar.gridSizeChanged.connect(self.on_grid_size_changed)
         self.sidebar.showPathsToggled.connect(self.on_show_paths_toggled)
         self.sidebar.jumpToFirstUnreviewed.connect(self.on_jump_to_first_unreviewed)
+        self.sidebar.showResolutionToggled.connect(self.on_show_info_master_toggled)
+        self.sidebar.showInfoResToggled.connect(self.on_show_info_res_toggled)
+        self.sidebar.showInfoSizeToggled.connect(self.on_show_info_size_toggled)
+        self.sidebar.showInfoFmtToggled.connect(self.on_show_info_fmt_toggled)
         self.store.currentChanged.connect(self.on_current_changed)
         self.store.statsChanged.connect(self.sidebar.update_stats)
 
@@ -88,6 +101,7 @@ class MainWindow(QMainWindow):
         self.viewer.requestRescale.connect(self._refresh_current_image)
         self.grid_view.requestRescale.connect(self._refresh_grid_page)
         self.grid_view.cellMarkRequested.connect(self.on_grid_cell_mark)
+        self.grid_view.openExternalRequested.connect(self.on_grid_open_external)
 
         # Grid shortcuts
         self._setup_grid_shortcuts()
@@ -100,43 +114,52 @@ class MainWindow(QMainWindow):
         # Fullscreen toggle (F11)
         act_fullscreen = QAction("Toggle Fullscreen", self)
         act_fullscreen.setShortcuts([QKeySequence(s) for s in CONFIG.hotkeys.toggle_fullscreen])
+        act_fullscreen.setShortcutContext(Qt.ApplicationShortcut)
         act_fullscreen.triggered.connect(self.toggle_fullscreen)
         self.addAction(act_fullscreen)
 
         # Navigation
         act_prev = QAction("Prev", self)
         act_prev.setShortcuts([QKeySequence(s) for s in CONFIG.hotkeys.prev])
+        act_prev.setShortcutContext(Qt.ApplicationShortcut)
         act_prev.triggered.connect(self.on_prev)
         self.addAction(act_prev)
 
         act_next = QAction("Next", self)
         act_next.setShortcuts([QKeySequence(s) for s in CONFIG.hotkeys.next])
+        act_next.setShortcutContext(Qt.ApplicationShortcut)
         act_next.triggered.connect(self.on_next)
         self.addAction(act_next)
 
         # Mark positive (Up) / negative (Down)
         act_mark_pos = QAction("Mark Positive", self)
         act_mark_pos.setShortcuts([QKeySequence(s) for s in CONFIG.hotkeys.mark_positive])
+        act_mark_pos.setShortcutContext(Qt.ApplicationShortcut)
         act_mark_pos.triggered.connect(lambda: self.on_mark(+1))
         self.addAction(act_mark_pos)
 
         act_mark_neg = QAction("Mark Negative", self)
         act_mark_neg.setShortcuts([QKeySequence(s) for s in CONFIG.hotkeys.mark_negative])
+        act_mark_neg.setShortcutContext(Qt.ApplicationShortcut)
         act_mark_neg.triggered.connect(lambda: self.on_mark(-1))
         self.addAction(act_mark_neg)
 
     def _setup_grid_shortcuts(self) -> None:
         for s in CONFIG.hotkeys.grid_mark_negative_batch:
             sc = QShortcut(QKeySequence(s), self)
+            sc.setContext(Qt.ApplicationShortcut)
             sc.activated.connect(lambda st=-1: self.on_grid_mark_batch(st))
         for s in CONFIG.hotkeys.grid_mark_positive_batch:
             sc = QShortcut(QKeySequence(s), self)
+            sc.setContext(Qt.ApplicationShortcut)
             sc.activated.connect(lambda st=+1: self.on_grid_mark_batch(st))
         for s in CONFIG.hotkeys.grid_next_page:
             sc = QShortcut(QKeySequence(s), self)
+            sc.setContext(Qt.ApplicationShortcut)
             sc.activated.connect(self.on_grid_next_page)
         for s in CONFIG.hotkeys.grid_prefill_next_positive:
             sc = QShortcut(QKeySequence(s), self)
+            sc.setContext(Qt.ApplicationShortcut)
             sc.activated.connect(self.on_grid_prefill_next_positive)
 
     # Slots / Handlers
@@ -149,6 +172,12 @@ class MainWindow(QMainWindow):
         # Init repo and DB
         self.repo = SQLiteRepository(folder, group_images=self.group_images)
         self.repo.init()
+
+        # Reflect selected path in sidebar
+        try:
+            self.sidebar.path_edit.setText(folder)
+        except Exception:
+            pass
 
         # Scan and sync
         filenames = scan_images(folder, grouped=self.group_images)
@@ -167,6 +196,15 @@ class MainWindow(QMainWindow):
 
         # Show first view based on mode
         self._apply_view_mode()
+        # After layout settles, refresh the grid again to lock correct tile sizes
+        from PySide6.QtCore import QTimer
+        if self._is_grid_mode():
+            QTimer.singleShot(0, self._refresh_grid_page)
+        # Move focus to the active viewer so shortcuts are not eaten by the path field
+        if self._is_grid_mode():
+            self.grid_view.setFocus(Qt.OtherFocusReason)
+        else:
+            self.viewer.setFocus(Qt.OtherFocusReason)
 
     @Slot()
     def on_prev(self) -> None:
@@ -327,7 +365,29 @@ class MainWindow(QMainWindow):
             idx = base_index + offset
             path = self.repo.abspath_for(rec['filename'], rec.get('status'))
             rel = os.path.relpath(path, self.repo.folder)
-            items.append({"index": idx, "path": path, "status": rec.get('status', 0), "rel": rel})
+            item = {"index": idx, "path": path, "status": rec.get('status', 0), "rel": rel}
+            if self._show_info_res:
+                try:
+                    reader = QImageReader(path)
+                    sz = reader.size()
+                    if sz.isValid():
+                        item["w"] = sz.width()
+                        item["h"] = sz.height()
+                except Exception:
+                    pass
+            if self._show_info_size:
+                try:
+                    kb = max(0, int(os.path.getsize(path) / 1024))
+                    item["size_kb"] = kb
+                except Exception:
+                    pass
+            if self._show_info_fmt:
+                try:
+                    ext = os.path.splitext(path)[1][1:].upper()
+                    item["fmt"] = ext
+                except Exception:
+                    pass
+            items.append(item)
         self.grid_view.set_items(items)
         # Badge info
         total = len(self.store.records())
@@ -335,6 +395,9 @@ class MainWindow(QMainWindow):
         end = base_index + len(recs)
         self.grid_view.set_page_info(start, end, total)
         self.grid_view.set_show_paths(self._show_paths)
+        self.grid_view.set_show_info_res(self._show_info_res if self._show_info_master else False)
+        self.grid_view.set_show_info_size(self._show_info_size if self._show_info_master else False)
+        self.grid_view.set_show_info_fmt(self._show_info_fmt if self._show_info_master else False)
 
     @Slot(int, int)
     def on_grid_cell_mark(self, global_index: int, new_status: int) -> None:
@@ -369,6 +432,27 @@ class MainWindow(QMainWindow):
                         pass
         self._refresh_grid_page()
 
+    @Slot(int)
+    def on_grid_open_external(self, global_index: int) -> None:
+        if not self.repo:
+            return
+        rec = self.store.record_at(global_index)
+        if not rec:
+            return
+        path = self.repo.abspath_for(rec['filename'], rec.get('status'))
+        self._open_external(path)
+
+    def _open_external(self, path: str) -> None:
+        try:
+            if sys.platform.startswith('win'):
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', path])
+            else:
+                subprocess.Popen(['xdg-open', path])
+        except Exception:
+            pass
+
     @Slot(bool)
     def on_show_paths_toggled(self, show: bool) -> None:
         self._show_paths = show
@@ -383,6 +467,43 @@ class MainWindow(QMainWindow):
                     self.viewer.set_path_text(rel)
             else:
                 self.viewer.set_path_text(None)
+
+    @Slot(bool)
+    def on_show_info_master_toggled(self, show: bool) -> None:
+        self._show_info_master = show
+        if show:
+            # Sync child flags from sidebar current check states
+            try:
+                self._show_info_res = bool(self.sidebar.chk_info_res.isChecked())
+                self._show_info_size = bool(self.sidebar.chk_info_size.isChecked())
+                self._show_info_fmt = bool(self.sidebar.chk_info_fmt.isChecked())
+            except Exception:
+                pass
+        else:
+            # Hide all info badges when master is off
+            self._show_info_res = False
+            self._show_info_size = False
+            self._show_info_fmt = False
+        if self._is_grid_mode():
+            self._refresh_grid_page()
+
+    @Slot(bool)
+    def on_show_info_res_toggled(self, show: bool) -> None:
+        self._show_info_res = show
+        if self._is_grid_mode():
+            self._refresh_grid_page()
+
+    @Slot(bool)
+    def on_show_info_size_toggled(self, show: bool) -> None:
+        self._show_info_size = show
+        if self._is_grid_mode():
+            self._refresh_grid_page()
+
+    @Slot(bool)
+    def on_show_info_fmt_toggled(self, show: bool) -> None:
+        self._show_info_fmt = show
+        if self._is_grid_mode():
+            self._refresh_grid_page()
 
     @Slot()
     def on_grid_next_page(self) -> None:

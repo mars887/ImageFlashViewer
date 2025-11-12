@@ -22,6 +22,7 @@ def _parse_bool(val: str) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="ImageFlashViewer GUI and CLI")
+    parser.add_argument("path", nargs="?", default=None, help="Folder with images and DB (positional)")
     parser.add_argument("--folder", type=str, help="Folder with images and DB", default=None)
     parser.add_argument("--export", type=str, choices=["status", "negative", "positive", "unfiltered"], help="Export mode", default=None)
     parser.add_argument("--export_format", type=str, choices=["json", "csv"], help="Export format", default="csv")
@@ -32,13 +33,14 @@ def main():
     args = parser.parse_args()
 
     group_images = _parse_bool(args.group_images)
+    folder_arg = args.folder or args.path
 
     # Headless CLI operations if export or delete flags provided
     if args.export or args.delete_negative:
-        if not args.folder:
+        if not folder_arg:
             print("--folder is required for CLI operations", file=sys.stderr)
             sys.exit(2)
-        repo = SQLiteRepository(args.folder, group_images=group_images)
+        repo = SQLiteRepository(folder_arg, group_images=group_images)
         repo.init()
         # When grouping is enabled, make sure structure exists and matches statuses
         if group_images:
@@ -68,6 +70,13 @@ def main():
     window = MainWindow(group_images=group_images)
     # Start fullscreen by default
     window.showFullScreen()
+
+    # If a folder path was supplied positionally or via --folder, open it
+    if folder_arg:
+        try:
+            window.on_folder_selected(folder_arg)
+        except Exception:
+            pass
 
     sys.exit(app.exec())
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QRect, QPoint, Signal
+from PySide6.QtCore import Qt, QRect, QPoint, Signal, QTimer
 from PySide6.QtGui import QPainter, QColor, QImage, QPixmap, QMouseEvent
 from PySide6.QtWidgets import QWidget
 from ..config import CONFIG
@@ -19,6 +19,7 @@ from ..config import CONFIG
 class ViewGridWidget(QWidget):
     requestRescale = Signal()
     cellMarkRequested = Signal(int, int)  # global_index, new_status
+    openExternalRequested = Signal(int)  # global_index
 
     def __init__(self) -> None:
         super().__init__()
@@ -31,6 +32,9 @@ class ViewGridWidget(QWidget):
         self.setMinimumSize(200, 200)
         self.setMouseTracking(True)
         self._show_paths: bool = False
+        self._show_info_res: bool = False
+        self._show_info_size: bool = False
+        self._show_info_fmt: bool = False
 
     def set_request_image(self, fn) -> None:
         self._request_image = fn
@@ -79,6 +83,85 @@ class ViewGridWidget(QWidget):
             self._show_paths = show
             self.update()
 
+    def set_show_info_res(self, show: bool) -> None:
+        if self._show_info_res != show:
+            self._show_info_res = show
+            self.update()
+
+    def set_show_info_size(self, show: bool) -> None:
+        if self._show_info_size != show:
+            self._show_info_size = show
+            self.update()
+
+    def set_show_info_fmt(self, show: bool) -> None:
+        if self._show_info_fmt != show:
+            self._show_info_fmt = show
+            self.update()
+
+    def _format_mp(self, w: int, h: int) -> str:
+        mp = (w * h) / 1_000_000.0
+        s = f"{mp:.2f}".rstrip('0').rstrip('.')
+        return f"{s}M"
+
+    def _badge_color(self, w: int, h: int) -> QColor:
+        """Pick color using CONFIG.resolution_badges thresholds.
+        Compute ranks separately for megapixels (mp) and min side (ms), then
+        choose the worse (minimum) rank. The first/highest rule uses strict
+        '>' comparison; others use '>=' to match the examples.
+        """
+        mp = (w * h) / 1_000_000.0
+        ms = min(w, h)
+        rules = CONFIG.resolution_badges
+
+        def find_index(value, is_mp: bool) -> int:
+            # Return 0-based index in rules where value meets threshold.
+            for i, (mp_thr, ms_thr, _color) in enumerate(rules):
+                thr = mp_thr if is_mp else ms_thr
+                if i == 0:
+                    # top tier: strict greater than
+                    if value > thr:
+                        return i
+                else:
+                    if value >= thr:
+                        return i
+            return len(rules) - 1
+
+        i_mp = find_index(mp, True)
+        i_ms = find_index(ms, False)
+
+        # Convert indices (0=best ... n-1=worst) to ranks (1=worst ... n=best)
+        n = len(rules)
+        rank_mp = n - i_mp
+        rank_ms = n - i_ms
+        final_rank = min(rank_mp, rank_ms)
+        idx = n - final_rank  # back to 0-based rule index
+
+        _, _, hex_color = rules[idx]
+        c = QColor(hex_color)
+        c.setAlpha(CONFIG.resolution_badge_alpha)
+        return c
+
+    def _size_badge_color(self, kb: int) -> QColor:
+        """Pick color for file size badge using CONFIG.size_badges.
+        Rules are ordered from high to low; top rule uses strict '>' and others
+        use '>=' to mirror resolution logic.
+        """
+        rules = CONFIG.size_badges
+        idx = len(rules) - 1
+        for i, (thr_kb, hex_color) in enumerate(rules):
+            if i == 0:
+                if kb > thr_kb:
+                    idx = i
+                    break
+            else:
+                if kb >= thr_kb:
+                    idx = i
+                    break
+        hex_color = rules[idx][1]
+        c = QColor(hex_color)
+        c.setAlpha(CONFIG.resolution_badge_alpha)
+        return c
+
     def update_item_status(self, global_index: int, status: int) -> None:
         for it in self._items:
             if it.get("index") == global_index:
@@ -90,6 +173,10 @@ class ViewGridWidget(QWidget):
         if not self._request_image:
             return
         tw, th = self.viewport_tile_size()
+        # If tiles are not laid out yet (very small), defer loading until after layout
+        if tw < 8 or th < 8:
+            QTimer.singleShot(0, self.requestRescale.emit)
+            return
         for it in self._items:
             idx = it.get("index")
             path = it.get("path")
@@ -117,12 +204,18 @@ class ViewGridWidget(QWidget):
                     item = self._items[i]
                     img = self._images.get(item.get("index", -1))
                     if img is not None and not img.isNull():
-                        scaled = img  # already scaled by preloader request
-                        pm = QPixmap.fromImage(scaled)
+                        # Always scale to current tile size to avoid undersized/oversized cached images
+                        pm = QPixmap.fromImage(img).scaled(
+                            rect.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                        )
                         # center inside rect
                         x = rect.x() + (rect.width() - pm.width()) // 2
                         y = rect.y() + (rect.height() - pm.height()) // 2
+                        # Clip drawing to tile rect to avoid bleed
+                        p.save()
+                        p.setClipRect(rect)
                         p.drawPixmap(x, y, pm)
+                        p.restore()
                     # Status stripe (only when not showing path bar)
                     st = int(item.get("status", 0))
                     if st != 0 and not self._show_paths:
@@ -132,6 +225,61 @@ class ViewGridWidget(QWidget):
                 # Border
                 p.setPen(QColor(*CONFIG.border_color))
                 p.drawRect(rect)
+                # Info badges (top-right): order right->left: Res, Size, Fmt
+                fm = self.fontMetrics()
+                pad_x, pad_y = 6, 2
+                gap = 4
+                cursor_x = rect.right() - 6
+                top_y = rect.y() + 6
+                if i < len(self._items):
+                    it = self._items[i]
+                    # Res
+                    if self._show_info_res:
+                        w = it.get("w")
+                        h = it.get("h")
+                        if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+                            text = self._format_mp(w, h)
+                            tw = fm.horizontalAdvance(text) + pad_x * 2
+                            th = fm.height() + pad_y * 2
+                            badge = QRect(cursor_x - tw, top_y, tw, th)
+                            color = self._badge_color(w, h)
+                            p.fillRect(badge, color)
+                            p.setPen(QColor(0, 0, 0, 180))
+                            p.drawRect(badge)
+                            p.setPen(QColor(20, 20, 20))
+                            p.drawText(badge, Qt.AlignCenter, text)
+                            cursor_x = badge.left() - gap
+                    # Size
+                    if self._show_info_size:
+                        kb = it.get("size_kb")
+                        if isinstance(kb, int) and kb >= 0:
+                            text = f"{kb}KБ"
+                            tw = fm.horizontalAdvance(text) + pad_x * 2
+                            th = fm.height() + pad_y * 2
+                            badge = QRect(cursor_x - tw, top_y, tw, th)
+                            color = self._size_badge_color(kb)
+                            p.fillRect(badge, color)
+                            p.setPen(QColor(0, 0, 0, 180))
+                            p.drawRect(badge)
+                            p.setPen(QColor(20, 20, 20))
+                            p.drawText(badge, Qt.AlignCenter, text)
+                            cursor_x = badge.left() - gap
+                    # Fmt
+                    if self._show_info_fmt:
+                        fmt = it.get("fmt")
+                        if isinstance(fmt, str) and fmt:
+                            text = fmt
+                            tw = fm.horizontalAdvance(text) + pad_x * 2
+                            th = fm.height() + pad_y * 2
+                            badge = QRect(cursor_x - tw, top_y, tw, th)
+                            color = QColor(CONFIG.format_badge_color)
+                            color.setAlpha(CONFIG.resolution_badge_alpha)
+                            p.fillRect(badge, color)
+                            p.setPen(QColor(0, 0, 0, 180))
+                            p.drawRect(badge)
+                            p.setPen(QColor(20, 20, 20))
+                            p.drawText(badge, Qt.AlignCenter, text)
+                            cursor_x = badge.left() - gap
                 i += 1
 
         # Overlay page badge (compact): "start–end of total"
@@ -202,6 +350,8 @@ class ViewGridWidget(QWidget):
                         elif event.button() == Qt.RightButton:
                             new_status = 0 if cur == -1 else -1
                             self.cellMarkRequested.emit(int(item.get("index")), new_status)
+                        elif event.button() == Qt.MiddleButton:
+                            self.openExternalRequested.emit(int(item.get("index")))
                     return
                 i += 1
         super().mousePressEvent(event)
