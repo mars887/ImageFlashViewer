@@ -245,6 +245,7 @@ class SQLiteRepository:
             negatives = [row[0] for row in cur.fetchall()]
 
         count = 0
+        removed_names: list[str] = []
         deleted_csv = os.path.join(self.folder, "deleted.csv")
         write_header = not os.path.exists(deleted_csv)
         try:
@@ -258,16 +259,25 @@ class SQLiteRepository:
 
         for fn in negatives:
             path = self.abspath_for(fn, -1) if self.group_images else self.abspath_for(fn)
+            if not os.path.exists(path):
+                removed_names.append(fn)
+                if writer:
+                    writer.writerow([
+                        datetime.now().isoformat(timespec="seconds"),
+                        fn,
+                        "missing before delete request",
+                    ])
+                continue
             try:
-                if os.path.exists(path):
-                    os.remove(path)
-                    count += 1
-                    if writer:
-                        writer.writerow([
-                            datetime.now().isoformat(timespec="seconds"),
-                            fn,
-                            "deleted as negative",
-                        ])
+                os.remove(path)
+                count += 1
+                removed_names.append(fn)
+                if writer:
+                    writer.writerow([
+                        datetime.now().isoformat(timespec="seconds"),
+                        fn,
+                        "deleted as negative",
+                    ])
             except Exception:
                 # skip failures
                 pass
@@ -279,10 +289,11 @@ class SQLiteRepository:
                 pass
 
         # Remove from DB
-        with self.connect() as conn:
-            cur = conn.cursor()
-            cur.executemany("DELETE FROM images WHERE filename = ?", [(fn,) for fn in negatives])
-            conn.commit()
+        if removed_names:
+            with self.connect() as conn:
+                cur = conn.cursor()
+                cur.executemany("DELETE FROM images WHERE filename = ?", [(fn,) for fn in removed_names])
+                conn.commit()
 
         return count
 

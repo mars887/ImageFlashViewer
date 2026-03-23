@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt
 from PySide6.QtGui import QImage
@@ -62,7 +62,8 @@ class ImagePreloader(QObject):
         self.cache: "OrderedDict[Tuple[str, Tuple[int, int]], QImage]" = OrderedDict()
         self.signals = _WorkerSignals()
         self.signals.loaded.connect(self._on_loaded)
-        self._pending_callbacks: Dict[Tuple[str, Tuple[int, int]], Optional[Callable[[QImage], None]]] = {}
+        self._pending_callbacks: Dict[Tuple[str, Tuple[int, int]], List[Callable[[QImage], None]]] = {}
+        self._inflight: Set[Tuple[str, Tuple[int, int]]] = set()
 
     def _key(self, path: str, size: Tuple[int, int]) -> Tuple[str, Tuple[int, int]]:
         return path, _normalize_size(size)
@@ -76,9 +77,13 @@ class ImagePreloader(QObject):
             # Move to MRU
             self.cache.move_to_end(key)
             return
-        # Remember callback for delivery when loaded
+
         if callback:
-            self._pending_callbacks[key] = callback
+            self._pending_callbacks.setdefault(key, []).append(callback)
+        if key in self._inflight:
+            return
+
+        self._inflight.add(key)
         # Schedule worker
         worker = _ImageLoadWorker(path, key[1], self.signals)
         self.pool.start(worker)
@@ -86,12 +91,13 @@ class ImagePreloader(QObject):
     @Slot(str, tuple, QImage)
     def _on_loaded(self, path: str, size: Tuple[int, int], image: QImage) -> None:
         key = (path, size)
+        self._inflight.discard(key)
         # Insert into cache
         self.cache[key] = image
         self.cache.move_to_end(key)
         while len(self.cache) > self.max_items:
             self.cache.popitem(last=False)
-        # Deliver pending callback if any
-        cb = self._pending_callbacks.pop(key, None)
-        if cb:
+        # Deliver any pending callbacks queued for this in-flight load.
+        callbacks = self._pending_callbacks.pop(key, [])
+        for cb in callbacks:
             cb(image)

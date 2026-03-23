@@ -66,6 +66,8 @@ class ImageStore(QObject):
 
     # Paging for grid mode
     def page_indices(self, rows: int, cols: int) -> List[int]:
+        if self._index < 0 or not self._records:
+            return []
         size = max(1, rows) * max(1, cols)
         end = min(len(self._records), self._index + size)
         return list(range(self._index, end))
@@ -88,6 +90,8 @@ class ImageStore(QObject):
         return False
 
     def prev_page(self, rows: int, cols: int) -> bool:
+        if not self._records or self._index < 0:
+            return False
         size = max(1, rows) * max(1, cols)
         new_index = max(0, self._index - size)
         if new_index != self._index:

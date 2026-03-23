@@ -1,7 +1,9 @@
 import sys
+import os
 import argparse
 from imageflash.ui.main_window import MainWindow
 from imageflash.data.repo import SQLiteRepository
+from imageflash.services.scanner import scan_images
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QCoreApplication
 
@@ -40,8 +42,12 @@ def main():
         if not folder_arg:
             print("--folder is required for CLI operations", file=sys.stderr)
             sys.exit(2)
+        if not os.path.isdir(folder_arg):
+            print(f"Folder does not exist: {folder_arg}", file=sys.stderr)
+            sys.exit(2)
         repo = SQLiteRepository(folder_arg, group_images=group_images)
         repo.init()
+        repo.sync_with_folder(scan_images(folder_arg, grouped=group_images))
         # When grouping is enabled, make sure structure exists and matches statuses
         if group_images:
             repo.enforce_grouping_for_all()

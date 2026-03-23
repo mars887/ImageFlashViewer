@@ -6,11 +6,10 @@ import subprocess
 import shutil
 from typing import Optional
 
-from PySide6.QtCore import Qt, QSize, Signal, Slot, QEvent, QPoint
+from PySide6.QtCore import Qt, Slot, QEvent, QPoint
 from PySide6.QtGui import QAction, QKeySequence, QKeyEvent
 from PySide6.QtWidgets import (
     QMainWindow,
-    QWidget,
     QSplitter,
     QMessageBox,
     QStackedWidget,
@@ -63,6 +62,8 @@ class MainWindow(QMainWindow):
         self._show_info_res = False
         self._show_info_size = False
         self._show_info_fmt = False
+        self._viewer_request_id = 0
+        self._overlay_request_id = 0
 
         # UI setup
         self.sidebar = SideBar()
@@ -187,7 +188,7 @@ class MainWindow(QMainWindow):
 
         # Scan and sync
         filenames = scan_images(folder, grouped=self.group_images)
-        removed = self.repo.sync_with_folder(filenames)
+        self.repo.sync_with_folder(filenames)
 
         # Load records and init store
         records = self.repo.get_all_records()
@@ -197,6 +198,7 @@ class MainWindow(QMainWindow):
         self.store.load_records(records)
 
         if not records:
+            self._apply_view_mode()
             QMessageBox.information(self, "Нет изображений", "В выбранной папке нет поддерживаемых изображений.")
             return
 
@@ -310,12 +312,11 @@ class MainWindow(QMainWindow):
         else:
             self.viewer.set_status(status)
             # Update path overlay if showing paths
-            if self._show_paths and self.repo:
-                rec = self.store.current_record()
-                if rec:
-                    path = self.repo.abspath_for(rec['filename'], rec.get('status'))
-                    rel = os.path.relpath(path, self.repo.folder)
-                    self.viewer.set_path_text(rel)
+            rec = self.store.current_record()
+            if self._show_paths and self.repo and rec:
+                path = self.repo.abspath_for(rec['filename'], rec.get('status'))
+                rel = os.path.relpath(path, self.repo.folder)
+                self.viewer.set_path_text(rel)
             else:
                 self.viewer.set_path_text(None)
 
@@ -328,12 +329,25 @@ class MainWindow(QMainWindow):
     def _refresh_current_image(self) -> None:
         path = self._current_file_abspath()
         if not path:
+            self._viewer_request_id += 1
+            self.viewer.set_image(None)
             return
         vw, vh = self.viewer.viewport_size()
         if vw <= 0 or vh <= 0:
             return
+
+        self._viewer_request_id += 1
+        request_id = self._viewer_request_id
+
+        def _set_current_image(image):
+            if request_id != self._viewer_request_id:
+                return
+            if path != self._current_file_abspath():
+                return
+            self.viewer.set_image(image)
+
         # Request from preloader
-        self.preloader.request(path, (vw, vh), self.viewer.set_image)
+        self.preloader.request(path, (vw, vh), _set_current_image)
 
     def _preload_neighbors(self, radius: int = None) -> None:
         if not self.repo:
@@ -357,33 +371,21 @@ class MainWindow(QMainWindow):
             self.showNormal()
         else:
             self.showFullScreen()
-        if hasattr(self, 'overlay'):
-            self.overlay.setGeometry(self.rect())
+        self._layout_overlay()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        if hasattr(self, 'overlay'):
-            self.overlay.setGeometry(self.rect())
+        self._layout_overlay()
 
     def eventFilter(self, obj, event):  # noqa: N802
         if event.type() == QEvent.MouseMove and self._del_held:
             self._overlay_forced_index = None
             self._update_overlay_image()
         return super().eventFilter(obj, event)
-        self._layout_overlay()
-
-    def resizeEvent(self, event) -> None:  # noqa: N802
-        super().resizeEvent(event)
-        self._layout_overlay()
 
     def _layout_overlay(self) -> None:
         if hasattr(self, 'overlay') and self.overlay:
             self.overlay.setGeometry(self.rect())
-
-    def eventFilter(self, obj, event):  # noqa: N802
-        if event.type() == QEvent.MouseMove and self._del_held:
-            self._update_overlay_image()
-        return super().eventFilter(obj, event)
 
     # Grid helpers and handlers
     def _is_grid_mode(self) -> bool:
@@ -408,8 +410,17 @@ class MainWindow(QMainWindow):
     def _refresh_grid_page(self) -> None:
         if not self.repo:
             return
-        items = []
         base_index = self.store.index()
+        if base_index < 0:
+            self.grid_view.set_items([])
+            self.grid_view.set_page_info(0, 0, len(self.store.records()))
+            self.grid_view.set_show_paths(self._show_paths)
+            self.grid_view.set_show_info_res(self._show_info_res if self._show_info_master else False)
+            self.grid_view.set_show_info_size(self._show_info_size if self._show_info_master else False)
+            self.grid_view.set_show_info_fmt(self._show_info_fmt if self._show_info_master else False)
+            return
+
+        items = []
         recs = self.store.current_page_records(self.grid_rows, self.grid_cols)
         for offset, rec in enumerate(recs):
             idx = base_index + offset
@@ -462,7 +473,9 @@ class MainWindow(QMainWindow):
                         self.repo.move_file_to_group(rec['filename'], new_status)
                     except Exception:
                         pass
-            self.grid_view.update_item_status(global_index, new_status)
+                self._refresh_grid_page()
+            else:
+                self.grid_view.update_item_status(global_index, new_status)
 
     def _grid_mark_all(self, status: int, only_unreviewed: bool = False) -> None:
         if not self.repo:
@@ -547,12 +560,11 @@ class MainWindow(QMainWindow):
         if self._is_grid_mode():
             self.grid_view.set_show_paths(show)
         else:
-            if show and self.repo:
-                rec = self.store.current_record()
-                if rec:
-                    path = self.repo.abspath_for(rec['filename'], rec.get('status'))
-                    rel = os.path.relpath(path, self.repo.folder)
-                    self.viewer.set_path_text(rel)
+            rec = self.store.current_record()
+            if show and self.repo and rec:
+                path = self.repo.abspath_for(rec['filename'], rec.get('status'))
+                rel = os.path.relpath(path, self.repo.folder)
+                self.viewer.set_path_text(rel)
             else:
                 self.viewer.set_path_text(None)
 
@@ -692,6 +704,9 @@ class MainWindow(QMainWindow):
         if event.key() in CONFIG.hotkeys.overlay_hold_keys:
             self._del_held = False
             self._overlay_forced_index = None
+            self._overlay_request_id += 1
+            self.overlay.set_image(None)
+            self.overlay.set_footer(None)
             self.overlay.hide_overlay()
             return
         super().keyReleaseEvent(event)
@@ -753,7 +768,12 @@ class MainWindow(QMainWindow):
         if r >= self.grid_rows or c >= self.grid_cols:
             return None
         base = self.store.index()
-        return base + r * self.grid_cols + c
+        if base < 0:
+            return None
+        idx = base + r * self.grid_cols + c
+        if idx >= len(self.store.records()):
+            return None
+        return idx
 
     def _update_overlay_image(self) -> None:
         if not self.repo:
@@ -820,10 +840,20 @@ class MainWindow(QMainWindow):
                     footer += f" • {wh_text}"
                 self.overlay.set_footer(footer)
         if not target_path:
+            self._overlay_request_id += 1
             self.overlay.set_image(None)
             self.overlay.set_footer(None)
             return
-        self.preloader.request(target_path, (vw, vh), self.overlay.set_image)
+
+        self._overlay_request_id += 1
+        request_id = self._overlay_request_id
+
+        def _set_overlay_image(image):
+            if request_id != self._overlay_request_id:
+                return
+            self.overlay.set_image(image)
+
+        self.preloader.request(target_path, (vw, vh), _set_overlay_image)
 
     def _format_bytes(self, num: int) -> str:
         units = ['B', 'KB', 'MB', 'GB', 'TB']
