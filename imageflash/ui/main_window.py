@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QMenu,
     QFileDialog,
+    QWidget,
+    QVBoxLayout,
 )
 from PySide6.QtGui import QShortcut
 
@@ -23,6 +25,7 @@ from ..services.scanner import scan_images
 from ..services.preloader import ImagePreloader
 from ..state.store import ImageStore
 from .sidebar import SideBar
+from .top_menu import TopMenuWidget
 from .view_single import ViewSingleWidget
 from .view_grid import ViewGridWidget
 from ..config import CONFIG
@@ -64,8 +67,11 @@ class MainWindow(QMainWindow):
         self._show_info_fmt = False
         self._viewer_request_id = 0
         self._overlay_request_id = 0
+        self._overlay_last_path: Optional[str] = None
+        self._overlay_last_footer: Optional[str] = None
 
         # UI setup
+        self.top_menu = TopMenuWidget()
         self.sidebar = SideBar()
         self.viewer = ViewSingleWidget()
         self.grid_view = ViewGridWidget()
@@ -79,8 +85,16 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.viewer)
         self.stack.addWidget(self.grid_view)
 
+        self.left_panel = QWidget()
+        left_layout = QVBoxLayout(self.left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
+        left_layout.addWidget(self.top_menu)
+        left_layout.addWidget(self.sidebar, 1)
+        self.left_panel.setMinimumWidth(360)
+
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self.sidebar)
+        splitter.addWidget(self.left_panel)
         splitter.addWidget(self.stack)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -90,16 +104,16 @@ class MainWindow(QMainWindow):
         self._setup_actions()
 
         # Wiring
-        self.sidebar.folderSelected.connect(self.on_folder_selected)
+        self.top_menu.folderSelected.connect(self.on_folder_selected)
         self.sidebar.gridSizeChanged.connect(self.on_grid_size_changed)
-        self.sidebar.showPathsToggled.connect(self.on_show_paths_toggled)
+        self.top_menu.showPathsToggled.connect(self.on_show_paths_toggled)
         self.sidebar.jumpToFirstUnreviewed.connect(self.on_jump_to_first_unreviewed)
-        self.sidebar.showResolutionToggled.connect(self.on_show_info_master_toggled)
-        self.sidebar.showInfoResToggled.connect(self.on_show_info_res_toggled)
-        self.sidebar.showInfoSizeToggled.connect(self.on_show_info_size_toggled)
-        self.sidebar.showInfoFmtToggled.connect(self.on_show_info_fmt_toggled)
-        self.sidebar.exportStatusTo.connect(self.on_export_status_to)
-        self.sidebar.deleteNegativeRequested.connect(self.on_delete_negative_requested)
+        self.top_menu.showInfoToggled.connect(self.on_show_info_master_toggled)
+        self.top_menu.showInfoResToggled.connect(self.on_show_info_res_toggled)
+        self.top_menu.showInfoSizeToggled.connect(self.on_show_info_size_toggled)
+        self.top_menu.showInfoFmtToggled.connect(self.on_show_info_fmt_toggled)
+        self.top_menu.exportStatusTo.connect(self.on_export_status_to)
+        self.top_menu.deleteNegativeRequested.connect(self.on_delete_negative_requested)
         self.store.currentChanged.connect(self.on_current_changed)
         self.store.statsChanged.connect(self.sidebar.update_stats)
 
@@ -114,8 +128,9 @@ class MainWindow(QMainWindow):
         self._setup_grid_shortcuts()
 
         # Event filters to update overlay while moving mouse
-        self.viewer.installEventFilter(self)
-        self.grid_view.installEventFilter(self)
+        self._install_overlay_filters(self.viewer)
+        self._install_overlay_filters(self.grid_view)
+        self._install_overlay_filters(self.left_panel)
 
     def _setup_actions(self) -> None:
         # Fullscreen toggle (F11)
@@ -169,6 +184,12 @@ class MainWindow(QMainWindow):
             sc.setContext(Qt.ApplicationShortcut)
             sc.activated.connect(self.on_grid_prefill_next_positive)
 
+    def _install_overlay_filters(self, root: QWidget) -> None:
+        widgets = [root, *root.findChildren(QWidget)]
+        for widget in widgets:
+            widget.setMouseTracking(True)
+            widget.installEventFilter(self)
+
     # Slots / Handlers
     @Slot(str)
     def on_folder_selected(self, folder: str) -> None:
@@ -182,7 +203,7 @@ class MainWindow(QMainWindow):
 
         # Reflect selected path in sidebar
         try:
-            self.sidebar.path_edit.setText(folder)
+            self.top_menu.set_path(folder)
         except Exception:
             pass
 
@@ -319,6 +340,8 @@ class MainWindow(QMainWindow):
                 self.viewer.set_path_text(rel)
             else:
                 self.viewer.set_path_text(None)
+        if self._del_held:
+            self._refresh_overlay_preview()
 
     def _current_file_abspath(self) -> Optional[str]:
         rec = self.store.current_record()
@@ -380,12 +403,101 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, event):  # noqa: N802
         if event.type() == QEvent.MouseMove and self._del_held:
             self._overlay_forced_index = None
-            self._update_overlay_image()
+            self._refresh_overlay_preview()
         return super().eventFilter(obj, event)
 
     def _layout_overlay(self) -> None:
         if hasattr(self, 'overlay') and self.overlay:
             self.overlay.setGeometry(self.rect())
+
+    def _cursor_in_left_panel(self) -> bool:
+        local_pos = self.mapFromGlobal(self.cursor().pos())
+        return self.left_panel.geometry().contains(local_pos)
+
+    def _hide_overlay_preview(self, clear_last: bool = False) -> None:
+        self._overlay_request_id += 1
+        self.overlay.set_image(None)
+        self.overlay.set_footer(None)
+        self.overlay.hide_overlay()
+        if clear_last:
+            self._overlay_last_path = None
+            self._overlay_last_footer = None
+
+    def _overlay_payload_for_record(self, rec) -> tuple[Optional[str], Optional[str]]:
+        if not self.repo or not rec:
+            return None, None
+
+        target_path = self.repo.abspath_for(rec['filename'], rec.get('status'))
+        rel = os.path.relpath(target_path, self.repo.folder)
+        size_text = ""
+        try:
+            size_bytes = os.path.getsize(target_path)
+            size_text = self._format_bytes(size_bytes)
+        except Exception:
+            size_text = "?"
+        wh_text = ""
+        try:
+            reader = QImageReader(target_path)
+            sz = reader.size()
+            if sz.isValid():
+                wh_text = f"{sz.width()}x{sz.height()}"
+        except Exception:
+            wh_text = ""
+
+        footer = f"{rel}"
+        if size_text:
+            footer += f" • {size_text}"
+        if wh_text:
+            footer += f" • {wh_text}"
+        return target_path, footer
+
+    def _refresh_overlay_preview(self) -> None:
+        if not self.repo or not self._del_held:
+            return
+        if self._cursor_in_left_panel():
+            self._hide_overlay_preview(clear_last=False)
+            return
+
+        vw, vh = self.overlay.viewport_size()
+        target_path = None
+        footer = None
+
+        if self._is_grid_mode():
+            if self._overlay_forced_index is not None:
+                idx = self._overlay_forced_index
+            else:
+                pos = self.grid_view.mapFromGlobal(self.cursor().pos())
+                idx = self.grid_view.index_at_point(pos) if self.grid_view.rect().contains(pos) else None
+            if idx is not None:
+                rec = self.store.record_at(idx)
+                if rec:
+                    target_path, footer = self._overlay_payload_for_record(rec)
+            elif self._overlay_last_path:
+                target_path = self._overlay_last_path
+                footer = self._overlay_last_footer
+        else:
+            rec = self.store.current_record()
+            if rec:
+                target_path, footer = self._overlay_payload_for_record(rec)
+
+        if not target_path:
+            self._hide_overlay_preview(clear_last=False)
+            return
+
+        self._overlay_last_path = target_path
+        self._overlay_last_footer = footer
+        self.overlay.set_footer(footer)
+        self.overlay.show_overlay()
+
+        self._overlay_request_id += 1
+        request_id = self._overlay_request_id
+
+        def _set_overlay_image(image):
+            if request_id != self._overlay_request_id:
+                return
+            self.overlay.set_image(image)
+
+        self.preloader.request(target_path, (vw, vh), _set_overlay_image)
 
     # Grid helpers and handlers
     def _is_grid_mode(self) -> bool:
@@ -476,6 +588,8 @@ class MainWindow(QMainWindow):
                 self._refresh_grid_page()
             else:
                 self.grid_view.update_item_status(global_index, new_status)
+            if self._del_held:
+                self._refresh_overlay_preview()
 
     def _grid_mark_all(self, status: int, only_unreviewed: bool = False) -> None:
         if not self.repo:
@@ -574,9 +688,9 @@ class MainWindow(QMainWindow):
         if show:
             # Sync child flags from sidebar current check states
             try:
-                self._show_info_res = bool(self.sidebar.chk_info_res.isChecked())
-                self._show_info_size = bool(self.sidebar.chk_info_size.isChecked())
-                self._show_info_fmt = bool(self.sidebar.chk_info_fmt.isChecked())
+                self._show_info_res = bool(self.top_menu.chk_info_res.isChecked())
+                self._show_info_size = bool(self.top_menu.chk_info_size.isChecked())
+                self._show_info_fmt = bool(self.top_menu.chk_info_fmt.isChecked())
             except Exception:
                 pass
         else:
@@ -659,9 +773,8 @@ class MainWindow(QMainWindow):
         if event.key() in CONFIG.hotkeys.overlay_hold_keys:
             if not self._del_held:
                 self._del_held = True
-                self.overlay.show_overlay()
-                self.overlay.setGeometry(self.rect())
-                self._update_overlay_image()
+                self._layout_overlay()
+                self._refresh_overlay_preview()
                 return
         if self._is_grid_mode():
             key = event.key()
@@ -688,7 +801,7 @@ class MainWindow(QMainWindow):
                     idx = self._index_for_numpad_key(key)
                     if idx is not None:
                         self._overlay_forced_index = idx
-                        self._update_overlay_image()
+                        self._refresh_overlay_preview()
                         return
                 self._handle_numpad_digit(key)
                 return
@@ -704,10 +817,7 @@ class MainWindow(QMainWindow):
         if event.key() in CONFIG.hotkeys.overlay_hold_keys:
             self._del_held = False
             self._overlay_forced_index = None
-            self._overlay_request_id += 1
-            self.overlay.set_image(None)
-            self.overlay.set_footer(None)
-            self.overlay.hide_overlay()
+            self._hide_overlay_preview(clear_last=True)
             return
         super().keyReleaseEvent(event)
 

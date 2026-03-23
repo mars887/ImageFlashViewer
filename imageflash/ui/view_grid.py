@@ -36,6 +36,10 @@ class ViewGridWidget(QWidget):
         self._show_info_res: bool = False
         self._show_info_size: bool = False
         self._show_info_fmt: bool = False
+        self._drag_button = Qt.NoButton
+        self._drag_from_status: Optional[int] = None
+        self._drag_to_status: Optional[int] = None
+        self._drag_seen: set[int] = set()
 
     def set_request_image(self, fn) -> None:
         self._request_image = fn
@@ -168,6 +172,46 @@ class ViewGridWidget(QWidget):
             if it.get("index") == global_index:
                 it["status"] = status
                 break
+        self.update()
+
+    def _item_at_point(self, pt) -> Optional[Dict]:
+        i = 0
+        for rr in range(self._rows):
+            for cc in range(self._cols):
+                if i < len(self._items):
+                    rect = self._tile_rect(rr, cc)
+                    if rect.contains(pt):
+                        return self._items[i]
+                i += 1
+        return None
+
+    def _drag_transition(self, button, current_status: int) -> Optional[Tuple[int, int]]:
+        if button == Qt.LeftButton:
+            return current_status, (0 if current_status == 1 else 1)
+        if button == Qt.RightButton:
+            return current_status, (0 if current_status == -1 else -1)
+        return None
+
+    def _reset_drag_state(self) -> None:
+        self._drag_button = Qt.NoButton
+        self._drag_from_status = None
+        self._drag_to_status = None
+        self._drag_seen.clear()
+
+    def _apply_drag_to_item(self, item: Dict) -> None:
+        if self._drag_button == Qt.NoButton or self._drag_from_status is None or self._drag_to_status is None:
+            return
+
+        index = int(item.get("index", -1))
+        if index < 0 or index in self._drag_seen:
+            return
+
+        self._drag_seen.add(index)
+        if int(item.get("status", 0)) != self._drag_from_status:
+            return
+
+        item["status"] = self._drag_to_status
+        self.cellMarkRequested.emit(index, self._drag_to_status)
         self.update()
 
     def _load_visible_images(self) -> None:
@@ -339,39 +383,49 @@ class ViewGridWidget(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         pos = event.position().toPoint()
-        # Find tile
-        i = 0
-        for rr in range(self._rows):
-            for cc in range(self._cols):
-                rect = self._tile_rect(rr, cc)
-                if rect.contains(pos):
-                    if i < len(self._items):
-                        item = self._items[i]
-                        cur = int(item.get("status", 0))
-                        if event.button() == Qt.LeftButton:
-                            new_status = 0 if cur == 1 else 1
-                            self.cellMarkRequested.emit(int(item.get("index")), new_status)
-                        elif event.button() == Qt.RightButton:
-                            new_status = 0 if cur == -1 else -1
-                            self.cellMarkRequested.emit(int(item.get("index")), new_status)
-                        elif event.button() == Qt.MiddleButton:
-                            if event.modifiers() & Qt.ShiftModifier:
-                                self.openExternalRequested.emit(int(item.get("index")))
-                            else:
-                                self.contextMenuRequested.emit(int(item.get("index")), event.globalPosition().toPoint())
-                    return
-                i += 1
+        item = self._item_at_point(pos)
+        if item is not None:
+            cur = int(item.get("status", 0))
+            transition = self._drag_transition(event.button(), cur)
+            if transition is not None:
+                self._drag_button = event.button()
+                self._drag_from_status, self._drag_to_status = transition
+                self._drag_seen.clear()
+                self._apply_drag_to_item(item)
+                return
+            if event.button() == Qt.MiddleButton:
+                index = int(item.get("index"))
+                if event.modifiers() & Qt.ShiftModifier:
+                    self.openExternalRequested.emit(index)
+                else:
+                    self.contextMenuRequested.emit(index, event.globalPosition().toPoint())
+                return
+        self._reset_drag_state()
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._drag_button == Qt.NoButton:
+            super().mouseMoveEvent(event)
+            return
+        if not (event.buttons() & self._drag_button):
+            self._reset_drag_state()
+            super().mouseMoveEvent(event)
+            return
+
+        item = self._item_at_point(event.position().toPoint())
+        if item is not None:
+            self._apply_drag_to_item(item)
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == self._drag_button:
+            self._reset_drag_state()
+        super().mouseReleaseEvent(event)
 
     def index_at_point(self, pt) -> Optional[int]:
         # Returns global index for cell under point, or None
-        i = 0
-        for rr in range(self._rows):
-            for cc in range(self._cols):
-                if i < len(self._items):
-                    rect = self._tile_rect(rr, cc)
-                    if rect.contains(pt):
-                        item = self._items[i]
-                        return int(item.get("index"))
-                i += 1
-        return None
+        item = self._item_at_point(pt)
+        if item is None:
+            return None
+        return int(item.get("index"))
