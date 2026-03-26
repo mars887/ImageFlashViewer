@@ -55,6 +55,11 @@ class Config:
     # Default grid size
     grid_default_cols: int = 3
     grid_default_rows: int = 2
+    grid_auto_balance: bool = True
+    grid_auto_balance_only_grow: bool = True
+    grid_balance_exponent: float = 0.80
+    grid_balance_min_factor: float = 0.9
+    grid_balance_max_factor: float = 1.75
 
     # Overlay
     overlay_margin: int = 32

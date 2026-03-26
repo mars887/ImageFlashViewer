@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from itertools import product
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QRect, QPoint, Signal, QTimer
@@ -36,6 +37,12 @@ class ViewGridWidget(QWidget):
         self._show_info_res: bool = False
         self._show_info_size: bool = False
         self._show_info_fmt: bool = False
+        self._auto_balance: bool = bool(CONFIG.grid_auto_balance)
+        self._auto_balance_only_grow: bool = bool(CONFIG.grid_auto_balance_only_grow)
+        self._cached_col_widths: Optional[List[int]] = None
+        self._cached_row_heights: Optional[List[int]] = None
+        self._expected_image_requests: Dict[int, Tuple[int, str, Tuple[int, int]]] = {}
+        self._image_request_serial: int = 0
         self._drag_button = Qt.NoButton
         self._drag_from_status: Optional[int] = None
         self._drag_to_status: Optional[int] = None
@@ -51,31 +58,219 @@ class ViewGridWidget(QWidget):
             return
         self._cols = cols
         self._rows = rows
+        self._invalidate_layout_cache()
         self._images.clear()
+        self._expected_image_requests.clear()
         self.requestRescale.emit()
         self.update()
 
     def grid_size(self) -> Tuple[int, int]:
         return self._cols, self._rows
 
+    def set_auto_balance(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._auto_balance == enabled:
+            return
+        self._auto_balance = enabled
+        self._invalidate_layout_cache()
+        self._images.clear()
+        self._expected_image_requests.clear()
+        self._load_visible_images()
+        self.update()
+
+    def set_auto_balance_only_grow(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._auto_balance_only_grow == enabled:
+            return
+        self._auto_balance_only_grow = enabled
+        self._invalidate_layout_cache()
+        self._images.clear()
+        self._expected_image_requests.clear()
+        self._load_visible_images()
+        self.update()
+
     def viewport_tile_size(self) -> Tuple[int, int]:
-        # Padding between tiles
+        # Average tile size used as a fallback/reference size.
         spacing = CONFIG.grid_tile_spacing
         w = max(1, (self.width() - (self._cols + 1) * spacing) // self._cols)
         h = max(1, (self.height() - (self._rows + 1) * spacing) // self._rows)
         return w, h
 
-    def _tile_rect(self, r: int, c: int) -> QRect:
+    def _invalidate_layout_cache(self) -> None:
+        self._cached_col_widths = None
+        self._cached_row_heights = None
+
+    def _item_aspect_ratio(self, item: Dict) -> float:
+        w = item.get("w")
+        h = item.get("h")
+        if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+            return max(0.05, min(20.0, w / float(h)))
+        return 1.0
+
+    def _item_dimensions(self, item: Dict) -> Tuple[float, float]:
+        w = item.get("w")
+        h = item.get("h")
+        if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+            return float(w), float(h)
+        ratio = self._item_aspect_ratio(item)
+        return ratio, 1.0
+
+    def _heuristic_weights(self, axis: str, count: int) -> List[float]:
+        if count <= 1:
+            return [1.0] * count
+
+        exponent = max(0.0, float(CONFIG.grid_balance_exponent))
+        min_factor = float(CONFIG.grid_balance_min_factor)
+        max_factor = float(CONFIG.grid_balance_max_factor)
+        weights: List[float] = []
+
+        for major in range(count):
+            samples: List[float] = []
+            minor_count = self._cols if axis == "row" else self._rows
+            for minor in range(minor_count):
+                row = major if axis == "row" else minor
+                col = minor if axis == "row" else major
+                index = row * self._cols + col
+                if index >= len(self._items):
+                    continue
+                ratio = self._item_aspect_ratio(self._items[index])
+                sample = (1.0 / ratio) ** exponent if axis == "row" else ratio ** exponent
+                samples.append(sample)
+
+            weight = (sum(samples) / len(samples)) if samples else 1.0
+            weight = max(min_factor, min(max_factor, weight))
+            weights.append(weight)
+
+        return weights
+
+    def _axis_size_candidates(self, total: int, axis: str, count: int) -> List[List[int]]:
+        if count <= 1:
+            return [[max(1, total)]]
+
+        min_factor = float(CONFIG.grid_balance_min_factor)
+        max_factor = float(CONFIG.grid_balance_max_factor)
+        levels = [min_factor, (min_factor + 1.0) * 0.5, 1.0, (1.0 + max_factor) * 0.5, max_factor]
+
+        candidates: List[List[int]] = []
+        seen: set[Tuple[int, ...]] = set()
+
+        def add_sizes(weights: List[float]) -> None:
+            sizes = tuple(self._distribute_sizes(total, weights))
+            if sizes not in seen:
+                seen.add(sizes)
+                candidates.append(list(sizes))
+
+        add_sizes([1.0] * count)
+        add_sizes(self._heuristic_weights(axis, count))
+        for combo in product(levels, repeat=count):
+            add_sizes(list(combo))
+        return candidates
+
+    def _layout_score(self, col_widths: List[int], row_heights: List[int]) -> Tuple[float, List[float]]:
+        total_area = 0.0
+        scales: List[float] = []
+
+        for index, item in enumerate(self._items):
+            row = index // self._cols
+            col = index % self._cols
+            if row >= self._rows or col >= self._cols:
+                break
+
+            src_w, src_h = self._item_dimensions(item)
+            scale = min(col_widths[col] / src_w, row_heights[row] / src_h)
+            scale = max(0.0, scale)
+            scales.append(scale)
+            total_area += (src_w * scale) * (src_h * scale)
+
+        return total_area, scales
+
+    def _distribute_sizes(self, total: int, weights: List[float]) -> List[int]:
+        if not weights:
+            return []
+
+        total = max(len(weights), total)
+        weight_sum = sum(weights) if sum(weights) > 0 else float(len(weights))
+        raw = [total * weight / weight_sum for weight in weights]
+        sizes = [int(value) for value in raw]
+        remainder = total - sum(sizes)
+        if remainder > 0:
+            order = sorted(range(len(weights)), key=lambda idx: raw[idx] - sizes[idx], reverse=True)
+            for idx in order[:remainder]:
+                sizes[idx] += 1
+        return [max(1, size) for size in sizes]
+
+    def _compute_layout_sizes(self) -> Tuple[List[int], List[int]]:
         spacing = CONFIG.grid_tile_spacing
-        tw, th = self.viewport_tile_size()
-        x = spacing + c * (tw + spacing)
-        y = spacing + r * (th + spacing)
-        return QRect(x, y, tw, th)
+        inner_width = max(self._cols, self.width() - (self._cols + 1) * spacing)
+        inner_height = max(self._rows, self.height() - (self._rows + 1) * spacing)
+
+        baseline_cols = self._distribute_sizes(inner_width, [1.0] * self._cols)
+        baseline_rows = self._distribute_sizes(inner_height, [1.0] * self._rows)
+        if not self._auto_balance or len(self._items) <= 1:
+            return baseline_cols, baseline_rows
+
+        baseline_score, baseline_scales = self._layout_score(baseline_cols, baseline_rows)
+        best_cols = baseline_cols
+        best_rows = baseline_rows
+        best_score = baseline_score
+
+        col_candidates = self._axis_size_candidates(inner_width, "col", self._cols)
+        row_candidates = self._axis_size_candidates(inner_height, "row", self._rows)
+
+        for col_sizes in col_candidates:
+            for row_sizes in row_candidates:
+                score, scales = self._layout_score(col_sizes, row_sizes)
+                if self._auto_balance_only_grow and any(
+                    scale + 1e-9 < base for scale, base in zip(scales, baseline_scales)
+                ):
+                    continue
+                if score > best_score + 1e-6:
+                    best_cols = col_sizes
+                    best_rows = row_sizes
+                    best_score = score
+
+        return best_cols, best_rows
+
+    def _ensure_layout_cache(self) -> None:
+        if (
+            self._cached_col_widths is not None
+            and self._cached_row_heights is not None
+            and len(self._cached_col_widths) == self._cols
+            and len(self._cached_row_heights) == self._rows
+        ):
+            return
+        self._cached_col_widths, self._cached_row_heights = self._compute_layout_sizes()
+
+    def _column_widths(self) -> List[int]:
+        self._ensure_layout_cache()
+        return list(self._cached_col_widths or [])
+
+    def _row_heights(self) -> List[int]:
+        self._ensure_layout_cache()
+        return list(self._cached_row_heights or [])
+
+    def _tile_rect(self, r: int, c: int) -> QRect:
+        if r < 0 or c < 0 or r >= self._rows or c >= self._cols:
+            return QRect()
+        spacing = CONFIG.grid_tile_spacing
+        col_widths = self._column_widths()
+        row_heights = self._row_heights()
+        if c >= len(col_widths) or r >= len(row_heights):
+            self._invalidate_layout_cache()
+            col_widths = self._column_widths()
+            row_heights = self._row_heights()
+        if c >= len(col_widths) or r >= len(row_heights):
+            return QRect()
+        x = spacing + sum(col_widths[:c]) + c * spacing
+        y = spacing + sum(row_heights[:r]) + r * spacing
+        return QRect(x, y, col_widths[c], row_heights[r])
 
     def set_items(self, items: List[Dict]) -> None:
         # items: [{index:int, path:str, status:int}]
         self._items = items
+        self._invalidate_layout_cache()
         self._images.clear()
+        self._expected_image_requests.clear()
         self._load_visible_images()
         self.update()
 
@@ -217,22 +412,37 @@ class ViewGridWidget(QWidget):
     def _load_visible_images(self) -> None:
         if not self._request_image:
             return
-        tw, th = self.viewport_tile_size()
-        # If tiles are not laid out yet (very small), defer loading until after layout
-        if tw < 8 or th < 8:
+        visible_count = min(len(self._items), self._rows * self._cols)
+        self._expected_image_requests.clear()
+        tile_rects = [
+            self._tile_rect(index // self._cols, index % self._cols)
+            for index in range(visible_count)
+        ]
+        # If tiles are not laid out yet (very small), defer loading until after layout.
+        if tile_rects and any(rect.width() < 8 or rect.height() < 8 for rect in tile_rects):
             QTimer.singleShot(0, self.requestRescale.emit)
             return
-        for it in self._items:
+
+        for index, it in enumerate(self._items[:visible_count]):
             idx = it.get("index")
             path = it.get("path")
             if idx is None or not path:
                 continue
-            def make_cb(i: int):
+            rect = self._tile_rect(index // self._cols, index % self._cols)
+            requested_size = (max(1, rect.width()), max(1, rect.height()))
+            self._image_request_serial += 1
+            token = self._image_request_serial
+            self._expected_image_requests[idx] = (token, path, requested_size)
+
+            def make_cb(i: int, expected_token: int, expected_path: str, expected_size: Tuple[int, int]):
                 def _cb(img: QImage):
+                    current = self._expected_image_requests.get(i)
+                    if current != (expected_token, expected_path, expected_size):
+                        return
                     self._images[i] = img
                     self.update()
                 return _cb
-            self._request_image(path, (tw, th), make_cb(idx))
+            self._request_image(path, requested_size, make_cb(idx, token, path, requested_size))
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
@@ -377,7 +587,9 @@ class ViewGridWidget(QWidget):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         self.requestRescale.emit()
+        self._invalidate_layout_cache()
         self._images.clear()
+        self._expected_image_requests.clear()
         self._load_visible_images()
         super().resizeEvent(event)
 

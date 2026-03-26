@@ -4,7 +4,7 @@ from collections import OrderedDict
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QImage, QImageReader
 from ..config import CONFIG
 
 # Developer Notes (services/preloader.py)
@@ -26,6 +26,10 @@ def _normalize_size(size: Tuple[int, int]) -> Tuple[int, int]:
 
 class _WorkerSignals(QObject):
     loaded = Signal(str, tuple, QImage)  # path, size, image
+
+
+class _SizeWorkerSignals(QObject):
+    loaded = Signal(str, object)  # path, Optional[(w, h)]
 
 
 class _ImageLoadWorker(QRunnable):
@@ -50,6 +54,25 @@ class _ImageLoadWorker(QRunnable):
             self.signals.loaded.emit(self.path, self.size, QImage())
 
 
+class _ImageSizeWorker(QRunnable):
+    def __init__(self, path: str, signals: _SizeWorkerSignals) -> None:
+        super().__init__()
+        self.path = path
+        self.signals = signals
+
+    @Slot()
+    def run(self) -> None:  # type: ignore[override]
+        size: Optional[Tuple[int, int]] = None
+        try:
+            reader = QImageReader(self.path)
+            image_size = reader.size()
+            if image_size.isValid() and image_size.width() > 0 and image_size.height() > 0:
+                size = (image_size.width(), image_size.height())
+        except Exception:
+            size = None
+        self.signals.loaded.emit(self.path, size)
+
+
 class ImagePreloader(QObject):
     """
     Simple threaded image preloader with in-memory LRU cache.
@@ -62,8 +85,12 @@ class ImagePreloader(QObject):
         self.cache: "OrderedDict[Tuple[str, Tuple[int, int]], QImage]" = OrderedDict()
         self.signals = _WorkerSignals()
         self.signals.loaded.connect(self._on_loaded)
+        self.size_signals = _SizeWorkerSignals()
+        self.size_signals.loaded.connect(self._on_size_loaded)
         self._pending_callbacks: Dict[Tuple[str, Tuple[int, int]], List[Callable[[QImage], None]]] = {}
         self._inflight: Set[Tuple[str, Tuple[int, int]]] = set()
+        self.size_cache: Dict[str, Optional[Tuple[int, int]]] = {}
+        self._size_inflight: Set[str] = set()
 
     def _key(self, path: str, size: Tuple[int, int]) -> Tuple[str, Tuple[int, int]]:
         return path, _normalize_size(size)
@@ -88,6 +115,27 @@ class ImagePreloader(QObject):
         worker = _ImageLoadWorker(path, key[1], self.signals)
         self.pool.start(worker)
 
+    def request_size(self, path: str) -> Optional[Tuple[int, int]]:
+        if path in self.size_cache:
+            return self.size_cache[path]
+        if path in self._size_inflight:
+            return None
+        self._size_inflight.add(path)
+        self.pool.start(_ImageSizeWorker(path, self.size_signals))
+        return None
+
+    def get_cached_size(self, path: str) -> Tuple[bool, Optional[Tuple[int, int]]]:
+        if path in self.size_cache:
+            return True, self.size_cache[path]
+        return False, None
+
+    def prime_size(self, path: str, size: Optional[Tuple[int, int]]) -> None:
+        self.size_cache[path] = size
+
+    def clear_size_cache(self) -> None:
+        self.size_cache.clear()
+        self._size_inflight.clear()
+
     @Slot(str, tuple, QImage)
     def _on_loaded(self, path: str, size: Tuple[int, int], image: QImage) -> None:
         key = (path, size)
@@ -101,3 +149,9 @@ class ImagePreloader(QObject):
         callbacks = self._pending_callbacks.pop(key, [])
         for cb in callbacks:
             cb(image)
+
+    @Slot(str, object)
+    def _on_size_loaded(self, path: str, size_obj) -> None:
+        self._size_inflight.discard(path)
+        size = size_obj if isinstance(size_obj, tuple) and len(size_obj) == 2 else None
+        self.size_cache[path] = size

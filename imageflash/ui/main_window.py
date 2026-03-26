@@ -4,9 +4,9 @@ import os
 import sys
 import subprocess
 import shutil
-from typing import Optional
+from typing import Optional, Tuple
 
-from PySide6.QtCore import Qt, Slot, QEvent, QPoint
+from PySide6.QtCore import Qt, Slot, QEvent, QPoint, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QKeyEvent
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -55,6 +55,8 @@ class MainWindow(QMainWindow):
         self.group_images = group_images
         self.grid_cols = CONFIG.grid_default_cols
         self.grid_rows = CONFIG.grid_default_rows
+        self._grid_auto_balance = bool(CONFIG.grid_auto_balance)
+        self._grid_auto_balance_only_grow = bool(CONFIG.grid_auto_balance_only_grow)
         self._sign_mode = None  # type: Optional[int]
         self._del_held = False
         self._overlay_forced_index = None  # type: Optional[int]
@@ -75,6 +77,8 @@ class MainWindow(QMainWindow):
         self.sidebar = SideBar()
         self.viewer = ViewSingleWidget()
         self.grid_view = ViewGridWidget()
+        self.grid_view.set_auto_balance(self._grid_auto_balance)
+        self.grid_view.set_auto_balance_only_grow(self._grid_auto_balance_only_grow)
         self.grid_view.set_request_image(self.preloader.request)
         self.overlay = OverlayWidget(self)
         # Ensure viewers can take focus for keyboard navigation
@@ -106,6 +110,8 @@ class MainWindow(QMainWindow):
         # Wiring
         self.top_menu.folderSelected.connect(self.on_folder_selected)
         self.sidebar.gridSizeChanged.connect(self.on_grid_size_changed)
+        self.sidebar.gridAutoBalanceToggled.connect(self.on_grid_auto_balance_toggled)
+        self.sidebar.gridAutoBalanceOnlyGrowToggled.connect(self.on_grid_auto_balance_only_grow_toggled)
         self.top_menu.showPathsToggled.connect(self.on_show_paths_toggled)
         self.sidebar.jumpToFirstUnreviewed.connect(self.on_jump_to_first_unreviewed)
         self.top_menu.showInfoToggled.connect(self.on_show_info_master_toggled)
@@ -200,6 +206,7 @@ class MainWindow(QMainWindow):
         # Init repo and DB
         self.repo = SQLiteRepository(folder, group_images=self.group_images)
         self.repo.init()
+        self.preloader.clear_size_cache()
 
         # Reflect selected path in sidebar
         try:
@@ -216,6 +223,7 @@ class MainWindow(QMainWindow):
         if self.group_images:
             # Ensure on-disk grouping matches DB statuses
             self.repo.enforce_grouping_for_all()
+        self.grid_view.set_grid_size(self.grid_cols, self.grid_rows)
         self.store.load_records(records)
 
         if not records:
@@ -226,7 +234,6 @@ class MainWindow(QMainWindow):
         # Show first view based on mode
         self._apply_view_mode()
         # After layout settles, refresh the grid again to lock correct tile sizes
-        from PySide6.QtCore import QTimer
         if self._is_grid_mode():
             QTimer.singleShot(0, self._refresh_grid_page)
         # Move focus to the active viewer so shortcuts are not eaten by the path field
@@ -349,6 +356,42 @@ class MainWindow(QMainWindow):
             return None
         return self.repo.abspath_for(rec['filename'], rec.get('status'))
 
+    def _read_image_dimensions(self, path: str) -> Optional[Tuple[int, int]]:
+        try:
+            reader = QImageReader(path)
+            sz = reader.size()
+            if sz.isValid() and sz.width() > 0 and sz.height() > 0:
+                return sz.width(), sz.height()
+        except Exception:
+            return None
+        return None
+
+    def _image_dimensions(self, path: str, blocking: bool = False) -> Optional[Tuple[int, int]]:
+        cached, size = self.preloader.get_cached_size(path)
+        if cached:
+            return size
+        if not blocking:
+            self.preloader.request_size(path)
+            return None
+        size = self._read_image_dimensions(path)
+        self.preloader.prime_size(path, size)
+        return size
+
+    def _warm_grid_dimensions(self, start_index: int, page_count: int = 2) -> None:
+        if not self.repo:
+            return
+        if not (self._grid_auto_balance or (self._show_info_master and self._show_info_res)):
+            return
+        page_size = max(1, self.grid_rows * self.grid_cols)
+        start_index = max(0, start_index)
+        end_index = min(len(self.store.records()), start_index + page_size * max(1, page_count))
+        for idx in range(start_index, end_index):
+            rec = self.store.record_at(idx)
+            if not rec:
+                continue
+            path = self.repo.abspath_for(rec['filename'], rec.get('status'))
+            self.preloader.request_size(path)
+
     def _refresh_current_image(self) -> None:
         path = self._current_file_abspath()
         if not path:
@@ -436,13 +479,9 @@ class MainWindow(QMainWindow):
         except Exception:
             size_text = "?"
         wh_text = ""
-        try:
-            reader = QImageReader(target_path)
-            sz = reader.size()
-            if sz.isValid():
-                wh_text = f"{sz.width()}x{sz.height()}"
-        except Exception:
-            wh_text = ""
+        size = self._image_dimensions(target_path, blocking=True)
+        if size:
+            wh_text = f"{size[0]}x{size[1]}"
 
         footer = f"{rel}"
         if size_text:
@@ -509,6 +548,20 @@ class MainWindow(QMainWindow):
         self.grid_rows = rows
         self._apply_view_mode()
 
+    @Slot(bool)
+    def on_grid_auto_balance_toggled(self, enabled: bool) -> None:
+        self._grid_auto_balance = bool(enabled)
+        self.grid_view.set_auto_balance(self._grid_auto_balance)
+        if self._is_grid_mode():
+            self._refresh_grid_page()
+
+    @Slot(bool)
+    def on_grid_auto_balance_only_grow_toggled(self, enabled: bool) -> None:
+        self._grid_auto_balance_only_grow = bool(enabled)
+        self.grid_view.set_auto_balance_only_grow(self._grid_auto_balance_only_grow)
+        if self._is_grid_mode():
+            self._refresh_grid_page()
+
     def _apply_view_mode(self) -> None:
         if self._is_grid_mode():
             self.stack.setCurrentWidget(self.grid_view)
@@ -534,27 +587,28 @@ class MainWindow(QMainWindow):
 
         items = []
         recs = self.store.current_page_records(self.grid_rows, self.grid_cols)
+        need_dimensions = self._grid_auto_balance or (self._show_info_master and self._show_info_res)
+        need_paths = self._show_paths
+        need_info_size = self._show_info_master and self._show_info_size
+        need_info_fmt = self._show_info_master and self._show_info_fmt
         for offset, rec in enumerate(recs):
             idx = base_index + offset
             path = self.repo.abspath_for(rec['filename'], rec.get('status'))
-            rel = os.path.relpath(path, self.repo.folder)
-            item = {"index": idx, "path": path, "status": rec.get('status', 0), "rel": rel}
-            if self._show_info_res:
-                try:
-                    reader = QImageReader(path)
-                    sz = reader.size()
-                    if sz.isValid():
-                        item["w"] = sz.width()
-                        item["h"] = sz.height()
-                except Exception:
-                    pass
-            if self._show_info_size:
+            item = {"index": idx, "path": path, "status": rec.get('status', 0)}
+            if need_paths:
+                item["rel"] = os.path.relpath(path, self.repo.folder)
+            if need_dimensions:
+                size = self._image_dimensions(path, blocking=True)
+                if size:
+                    item["w"] = size[0]
+                    item["h"] = size[1]
+            if need_info_size:
                 try:
                     kb = max(0, int(os.path.getsize(path) / 1024))
                     item["size_kb"] = kb
                 except Exception:
                     pass
-            if self._show_info_fmt:
+            if need_info_fmt:
                 try:
                     ext = os.path.splitext(path)[1][1:].upper()
                     item["fmt"] = ext
@@ -571,6 +625,7 @@ class MainWindow(QMainWindow):
         self.grid_view.set_show_info_res(self._show_info_res if self._show_info_master else False)
         self.grid_view.set_show_info_size(self._show_info_size if self._show_info_master else False)
         self.grid_view.set_show_info_fmt(self._show_info_fmt if self._show_info_master else False)
+        self._warm_grid_dimensions(base_index + len(recs))
 
     @Slot(int, int)
     def on_grid_cell_mark(self, global_index: int, new_status: int) -> None:
