@@ -4,11 +4,12 @@ import os
 import sys
 import subprocess
 import shutil
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from PySide6.QtCore import Qt, Slot, QEvent, QPoint, QTimer
-from PySide6.QtGui import QAction, QKeySequence, QKeyEvent
+from PySide6.QtGui import QAction, QGuiApplication, QImage, QKeySequence, QKeyEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QMainWindow,
     QSplitter,
     QMessageBox,
@@ -71,6 +72,20 @@ class MainWindow(QMainWindow):
         self._overlay_request_id = 0
         self._overlay_last_path: Optional[str] = None
         self._overlay_last_footer: Optional[str] = None
+        self._overlay_last_index: Optional[int] = None
+        self._overlay_last_status: Optional[int] = None
+        self._overlay_locked = False
+        self._overlay_locked_index: Optional[int] = None
+        self._overlay_lock_pending = False
+        self._overlay_footer_cache: Dict[str, str] = {}
+        self._grid_size_refresh_timer = QTimer(self)
+        self._grid_size_refresh_timer.setSingleShot(True)
+        self._grid_size_refresh_timer.setInterval(25)
+        self._grid_size_refresh_timer.timeout.connect(self._refresh_grid_page)
+        try:
+            QImageReader.setAllocationLimit(1024)
+        except Exception:
+            pass
 
         # UI setup
         self.top_menu = TopMenuWidget()
@@ -129,6 +144,14 @@ class MainWindow(QMainWindow):
         self.grid_view.cellMarkRequested.connect(self.on_grid_cell_mark)
         self.grid_view.openExternalRequested.connect(self.on_grid_open_external)
         self.grid_view.contextMenuRequested.connect(self.on_grid_context_menu)
+        self.preloader.sizeLoaded.connect(self._on_preloader_size_loaded)
+        self.overlay.copyRequested.connect(self.on_overlay_copy_requested)
+        self.overlay.externalRequested.connect(self.on_overlay_external_requested)
+        self.overlay.folderRequested.connect(self.on_overlay_folder_requested)
+        self.overlay.replaceRequested.connect(self.on_overlay_replace_requested)
+        self.overlay.statusRequested.connect(self.on_overlay_status_requested)
+        self.overlay.unlockRequested.connect(self.on_overlay_unlock_requested)
+        self.overlay.requestImageRefresh.connect(self._refresh_overlay_preview)
 
         # Grid shortcuts
         self._setup_grid_shortcuts()
@@ -207,6 +230,8 @@ class MainWindow(QMainWindow):
         self.repo = SQLiteRepository(folder, group_images=self.group_images)
         self.repo.init()
         self.preloader.clear_size_cache()
+        self._overlay_footer_cache.clear()
+        self._hide_overlay_preview(clear_last=True)
 
         # Reflect selected path in sidebar
         try:
@@ -347,7 +372,7 @@ class MainWindow(QMainWindow):
                 self.viewer.set_path_text(rel)
             else:
                 self.viewer.set_path_text(None)
-        if self._del_held:
+        if self._del_held or self._overlay_locked:
             self._refresh_overlay_preview()
 
     def _current_file_abspath(self) -> Optional[str]:
@@ -383,6 +408,8 @@ class MainWindow(QMainWindow):
         if not (self._grid_auto_balance or (self._show_info_master and self._show_info_res)):
             return
         page_size = max(1, self.grid_rows * self.grid_cols)
+        if page_size > 25:
+            page_count = min(page_count, 1)
         start_index = max(0, start_index)
         end_index = min(len(self.store.records()), start_index + page_size * max(1, page_count))
         for idx in range(start_index, end_index):
@@ -391,6 +418,24 @@ class MainWindow(QMainWindow):
                 continue
             path = self.repo.abspath_for(rec['filename'], rec.get('status'))
             self.preloader.request_size(path)
+
+    def _current_grid_paths(self) -> set[str]:
+        if not self.repo or not self._is_grid_mode():
+            return set()
+        return {
+            self.repo.abspath_for(rec['filename'], rec.get('status'))
+            for rec in self.store.current_page_records(self.grid_rows, self.grid_cols)
+        }
+
+    @Slot(str)
+    def _on_preloader_size_loaded(self, path: str) -> None:
+        if not self.repo or not self._is_grid_mode():
+            return
+        if not (self._grid_auto_balance or (self._show_info_master and self._show_info_res)):
+            return
+        if path not in self._current_grid_paths():
+            return
+        self._grid_size_refresh_timer.start()
 
     def _refresh_current_image(self) -> None:
         path = self._current_file_abspath()
@@ -444,7 +489,7 @@ class MainWindow(QMainWindow):
         self._layout_overlay()
 
     def eventFilter(self, obj, event):  # noqa: N802
-        if event.type() == QEvent.MouseMove and self._del_held:
+        if event.type() == QEvent.MouseMove and self._del_held and not self._overlay_locked:
             self._overlay_forced_index = None
             self._refresh_overlay_preview()
         return super().eventFilter(obj, event)
@@ -457,16 +502,26 @@ class MainWindow(QMainWindow):
         local_pos = self.mapFromGlobal(self.cursor().pos())
         return self.left_panel.geometry().contains(local_pos)
 
+    def _set_overlay_locked(self, locked: bool, index: Optional[int] = None) -> None:
+        self._overlay_locked = bool(locked)
+        self._overlay_locked_index = index if self._overlay_locked else None
+        self.overlay.set_locked(self._overlay_locked)
+
     def _hide_overlay_preview(self, clear_last: bool = False) -> None:
         self._overlay_request_id += 1
+        self._overlay_lock_pending = False
+        self._set_overlay_locked(False)
+        self.overlay.set_status(None)
         self.overlay.set_image(None)
         self.overlay.set_footer(None)
         self.overlay.hide_overlay()
         if clear_last:
             self._overlay_last_path = None
             self._overlay_last_footer = None
+            self._overlay_last_index = None
+            self._overlay_last_status = None
 
-    def _overlay_payload_for_record(self, rec) -> tuple[Optional[str], Optional[str]]:
+    def _overlay_payload_for_record_legacy(self, rec) -> tuple[Optional[str], Optional[str]]:
         if not self.repo or not rec:
             return None, None
 
@@ -490,7 +545,7 @@ class MainWindow(QMainWindow):
             footer += f" • {wh_text}"
         return target_path, footer
 
-    def _refresh_overlay_preview(self) -> None:
+    def _refresh_overlay_preview_legacy_old(self) -> None:
         if not self.repo or not self._del_held:
             return
         if self._cursor_in_left_panel():
@@ -542,10 +597,18 @@ class MainWindow(QMainWindow):
     def _is_grid_mode(self) -> bool:
         return not (self.grid_cols == 1 and self.grid_rows == 1)
 
+    def _is_numpad_grid_enabled(self) -> bool:
+        limit = int(CONFIG.grid_numpad_max_dimension)
+        return self.grid_cols <= limit and self.grid_rows <= limit
+
     @Slot(int, int)
     def on_grid_size_changed(self, cols: int, rows: int) -> None:
         self.grid_cols = cols
         self.grid_rows = rows
+        if not self._is_numpad_grid_enabled():
+            self._overlay_forced_index = None
+            if self._del_held:
+                self._refresh_overlay_preview()
         self._apply_view_mode()
 
     @Slot(bool)
@@ -587,21 +650,27 @@ class MainWindow(QMainWindow):
 
         items = []
         recs = self.store.current_page_records(self.grid_rows, self.grid_cols)
-        need_dimensions = self._grid_auto_balance or (self._show_info_master and self._show_info_res)
+        need_layout_dimensions = self._grid_auto_balance
+        need_res_dimensions = self._show_info_master and self._show_info_res
         need_paths = self._show_paths
         need_info_size = self._show_info_master and self._show_info_size
         need_info_fmt = self._show_info_master and self._show_info_fmt
+        if need_res_dimensions and not need_layout_dimensions:
+            self._warm_grid_dimensions(base_index, page_count=1)
         for offset, rec in enumerate(recs):
             idx = base_index + offset
             path = self.repo.abspath_for(rec['filename'], rec.get('status'))
             item = {"index": idx, "path": path, "status": rec.get('status', 0)}
             if need_paths:
                 item["rel"] = os.path.relpath(path, self.repo.folder)
-            if need_dimensions:
+            size = None
+            if need_layout_dimensions:
                 size = self._image_dimensions(path, blocking=True)
-                if size:
-                    item["w"] = size[0]
-                    item["h"] = size[1]
+            elif need_res_dimensions:
+                size = self._image_dimensions(path, blocking=False)
+            if size:
+                item["w"] = size[0]
+                item["h"] = size[1]
             if need_info_size:
                 try:
                     kb = max(0, int(os.path.getsize(path) / 1024))
@@ -631,8 +700,14 @@ class MainWindow(QMainWindow):
     def on_grid_cell_mark(self, global_index: int, new_status: int) -> None:
         if not self.repo:
             return
+        old_path = None
+        old_rec = self.store.record_at(global_index)
+        if old_rec:
+            old_path = self.repo.abspath_for(old_rec['filename'], old_rec.get('status'))
         changed = self.store.mark_status_at(global_index, new_status, self.repo)
         if changed:
+            if old_path:
+                self._overlay_footer_cache.pop(old_path, None)
             if self.group_images and self.repo:
                 rec = self.store.record_at(global_index)
                 if rec:
@@ -643,7 +718,7 @@ class MainWindow(QMainWindow):
                 self._refresh_grid_page()
             else:
                 self.grid_view.update_item_status(global_index, new_status)
-            if self._del_held:
+            if self._del_held or self._overlay_locked:
                 self._refresh_overlay_preview()
 
     def _grid_mark_all(self, status: int, only_unreviewed: bool = False) -> None:
@@ -829,8 +904,18 @@ class MainWindow(QMainWindow):
             if not self._del_held:
                 self._del_held = True
                 self._layout_overlay()
-                self._refresh_overlay_preview()
+            if event.modifiers() & Qt.ControlModifier:
+                self._overlay_lock_pending = True
+            self._refresh_overlay_preview()
+            return
+        if event.key() == Qt.Key_Control and (self._del_held or self.overlay.isVisible()):
+            if self._overlay_locked:
+                self.on_overlay_unlock_requested()
                 return
+            self._overlay_lock_pending = True
+            if self._lock_overlay_current():
+                self._refresh_overlay_preview()
+            return
         if self._is_grid_mode():
             key = event.key()
             # Update chord flags for clear+minus
@@ -852,6 +937,8 @@ class MainWindow(QMainWindow):
                     self._sign_mode = 0
                 return
             if key in CONFIG.hotkeys.grid_digit_keys:
+                if not self._is_numpad_grid_enabled():
+                    return
                 if self._del_held:
                     idx = self._index_for_numpad_key(key)
                     if idx is not None:
@@ -869,10 +956,13 @@ class MainWindow(QMainWindow):
                 self._is_minus_held = False
             if event.key() in CONFIG.hotkeys.sign_clear_keys:
                 self._is_clear_held = False
+        if event.key() == Qt.Key_Control and not self._overlay_locked:
+            self._overlay_lock_pending = False
         if event.key() in CONFIG.hotkeys.overlay_hold_keys:
             self._del_held = False
             self._overlay_forced_index = None
-            self._hide_overlay_preview(clear_last=True)
+            if not self._overlay_locked:
+                self._hide_overlay_preview(clear_last=True)
             return
         super().keyReleaseEvent(event)
 
@@ -921,6 +1011,8 @@ class MainWindow(QMainWindow):
         self._refresh_grid_page()
 
     def _index_for_numpad_key(self, key: int):
+        if not self._is_numpad_grid_enabled():
+            return None
         key_to_rc = {
             Qt.Key_7: (0, 0), Qt.Key_8: (0, 1), Qt.Key_9: (0, 2),
             Qt.Key_4: (1, 0), Qt.Key_5: (1, 1), Qt.Key_6: (1, 2),
@@ -940,7 +1032,7 @@ class MainWindow(QMainWindow):
             return None
         return idx
 
-    def _update_overlay_image(self) -> None:
+    def _update_overlay_image_legacy(self) -> None:
         if not self.repo:
             return
         # Size for overlay content
@@ -1032,7 +1124,289 @@ class MainWindow(QMainWindow):
             size /= 1024
         return f"{num} B"
 
+    def _format_overlay_size(self, size_bytes: Optional[int]) -> str:
+        if size_bytes is None:
+            return "unavailable"
+        kb = size_bytes / 1024.0
+        if kb < 1024.0:
+            return f"{kb:.1f} KB"
+        return f"{size_bytes / (1024.0 * 1024.0):.2f} MB"
+
+    def _format_qimage_format(self, image_format) -> str:
+        text = getattr(image_format, "name", "") or str(image_format).split(".")[-1]
+        text = text.replace("Format_", "").replace("_", " ").strip()
+        if not text or text == "Invalid":
+            return "Unknown"
+        return text
+
+    def _short_metadata_value(self, value) -> str:
+        text = str(value).replace("\r", " ").replace("\n", " ").strip()
+        if len(text) > 96:
+            return f"{text[:93]}..."
+        return text
+
+    def _overlay_metadata_entries(self, path: str) -> list[str]:
+        entries: list[str] = []
+        try:
+            reader = QImageReader(path)
+            for key in list(reader.textKeys())[:6]:
+                try:
+                    value = self._short_metadata_value(reader.text(key))
+                except Exception:
+                    value = ""
+                if value:
+                    entries.append(f"{key}={value}")
+        except Exception:
+            pass
+        if entries:
+            return entries
+        try:
+            from PIL import ExifTags, Image  # type: ignore
+
+            with Image.open(path) as image:
+                exif = image.getexif()
+                if exif:
+                    for tag_id, value in list(exif.items())[:6]:
+                        label = ExifTags.TAGS.get(tag_id, str(tag_id))
+                        text = self._short_metadata_value(value)
+                        if text:
+                            entries.append(f"{label}={text}")
+        except Exception:
+            pass
+        return entries
+
+    def _build_overlay_footer(self, path: str) -> str:
+        cached = self._overlay_footer_cache.get(path)
+        if cached is not None:
+            return cached
+
+        size_bytes: Optional[int] = None
+        resolution = self._image_dimensions(path, blocking=True)
+        file_format = os.path.splitext(path)[1][1:].upper() or "Unknown"
+        color_format = "Unknown"
+        try:
+            size_bytes = os.path.getsize(path)
+        except Exception:
+            size_bytes = None
+        try:
+            reader = QImageReader(path)
+            fmt = bytes(reader.format()).decode("ascii", errors="ignore").upper()
+            if fmt:
+                file_format = fmt
+            if hasattr(reader, "imageFormat"):
+                color_format = self._format_qimage_format(reader.imageFormat())
+        except Exception:
+            pass
+
+        metadata_entries = self._overlay_metadata_entries(path)
+        lines = []
+        if resolution:
+            width, height = resolution
+            megapixels = (width * height) / 1_000_000.0
+            lines.append(f"Res: {width}x{height} - {megapixels:.2f} MP")
+        else:
+            lines.append("Res: unavailable")
+        lines.append(f"Size: {self._format_overlay_size(size_bytes)}")
+        if metadata_entries:
+            lines.append(f"Metadata: {'; '.join(metadata_entries)}")
+        lines.append(f"{file_format} - {color_format} | {path}")
+
+        footer = "\n".join(lines)
+        self._overlay_footer_cache[path] = footer
+        return footer
+
+    def _overlay_payload_for_index(
+        self,
+        index: Optional[int],
+    ) -> tuple[Optional[int], Optional[str], Optional[str], Optional[int]]:
+        if index is None or not self.repo:
+            return None, None, None, None
+        rec = self.store.record_at(index)
+        if not rec:
+            return None, None, None, None
+        target_path = self.repo.abspath_for(rec["filename"], rec.get("status"))
+        footer = self._build_overlay_footer(target_path)
+        return index, target_path, footer, int(rec.get("status", 0))
+
+    def _resolve_overlay_target(self) -> tuple[Optional[int], Optional[str], Optional[str], Optional[int]]:
+        if not self.repo:
+            return None, None, None, None
+        if self._overlay_locked:
+            return self._overlay_payload_for_index(self._overlay_locked_index)
+        if self._is_grid_mode():
+            idx = self._overlay_forced_index
+            if idx is None:
+                pos = self.grid_view.mapFromGlobal(self.cursor().pos())
+                if self.grid_view.rect().contains(pos):
+                    idx = self.grid_view.index_at_point(pos)
+            if idx is not None:
+                return self._overlay_payload_for_index(idx)
+            if self._overlay_last_path:
+                footer = self._overlay_last_footer or self._build_overlay_footer(self._overlay_last_path)
+                return self._overlay_last_index, self._overlay_last_path, footer, self._overlay_last_status
+            return None, None, None, None
+        return self._overlay_payload_for_index(self.store.index())
+
+    def _lock_overlay_current(self) -> bool:
+        idx, target_path, footer, status = self._resolve_overlay_target()
+        if not target_path:
+            return False
+        if idx is None:
+            idx = self._overlay_last_index
+        self._overlay_lock_pending = False
+        self._set_overlay_locked(True, idx)
+        self.overlay.set_footer(footer)
+        self.overlay.set_status(status)
+        self.overlay.show_overlay()
+        return True
+
+    def _refresh_overlay_preview(self) -> None:
+        if not self.repo or not (self._del_held or self._overlay_locked):
+            return
+        if not self._overlay_locked and self._cursor_in_left_panel():
+            self._hide_overlay_preview(clear_last=False)
+            return
+
+        idx, target_path, footer, status = self._resolve_overlay_target()
+        if not target_path:
+            self._hide_overlay_preview(clear_last=False)
+            return
+
+        if not self._overlay_locked and self._overlay_lock_pending:
+            self._set_overlay_locked(True, idx if idx is not None else self._overlay_last_index)
+            self._overlay_lock_pending = False
+
+        self._overlay_last_path = target_path
+        self._overlay_last_footer = footer
+        self._overlay_last_index = idx
+        self._overlay_last_status = status
+        self.overlay.set_footer(footer)
+        self.overlay.set_status(status)
+        self.overlay.show_overlay()
+
+        vw, vh = self.overlay.requested_image_size()
+        self._overlay_request_id += 1
+        request_id = self._overlay_request_id
+
+        def _set_overlay_image(image):
+            if request_id != self._overlay_request_id:
+                return
+            current_path = self._resolve_overlay_target()[1]
+            if current_path != target_path:
+                return
+            self.overlay.set_image(image)
+
+        self.preloader.request(target_path, (vw, vh), _set_overlay_image)
+
+    def _cycle_status(self, status: int) -> int:
+        return 1 if status == 0 else (-1 if status > 0 else 0)
+
+    def _open_containing_folder(self, path: str) -> None:
+        try:
+            if sys.platform.startswith('win'):
+                subprocess.Popen(['explorer', '/select,', os.path.normpath(path)])
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', '-R', path])
+            else:
+                subprocess.Popen(['xdg-open', os.path.dirname(path)])
+        except Exception:
+            pass
+
+    @Slot()
+    def on_overlay_copy_requested(self) -> None:
+        _, target_path, _, _ = self._resolve_overlay_target()
+        if not target_path:
+            return
+        image = QImage(target_path)
+        if image.isNull():
+            QMessageBox.warning(self, "Copy", f"Failed to read image:\n{target_path}")
+            return
+        QGuiApplication.clipboard().setImage(image)
+
+    @Slot()
+    def on_overlay_external_requested(self) -> None:
+        _, target_path, _, _ = self._resolve_overlay_target()
+        if target_path:
+            self._open_external(target_path)
+
+    @Slot()
+    def on_overlay_folder_requested(self) -> None:
+        _, target_path, _, _ = self._resolve_overlay_target()
+        if target_path:
+            self._open_containing_folder(target_path)
+
+    @Slot()
+    def on_overlay_unlock_requested(self) -> None:
+        if not self._overlay_locked:
+            return
+        self._overlay_lock_pending = False
+        self._set_overlay_locked(False)
+        if self._del_held:
+            self._refresh_overlay_preview()
+        else:
+            self._hide_overlay_preview(clear_last=True)
+
+    @Slot()
+    def on_overlay_replace_requested(self) -> None:
+        _, target_path, _, _ = self._resolve_overlay_target()
+        if not target_path:
+            return
+        src_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Replace Image",
+            os.path.dirname(target_path),
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff);;All Files (*)",
+        )
+        if not src_path:
+            return
+        if os.path.abspath(src_path) == os.path.abspath(target_path):
+            return
+        reader = QImageReader(src_path)
+        if not reader.canRead():
+            QMessageBox.warning(self, "Replace", f"Selected file is not a readable image:\n{src_path}")
+            return
+        try:
+            shutil.copy2(src_path, target_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Replace", f"Failed to replace image:\n{exc}")
+            return
+
+        self.preloader.invalidate_path(target_path)
+        self._overlay_footer_cache.pop(target_path, None)
+        self._overlay_last_footer = None
+        if self._is_grid_mode():
+            self._refresh_grid_page()
+        else:
+            self._refresh_current_image()
+            self._preload_neighbors()
+        self._refresh_overlay_preview()
+
+    @Slot()
+    def on_overlay_status_requested(self) -> None:
+        idx, target_path, _, status = self._resolve_overlay_target()
+        if idx is None or status is None:
+            return
+        new_status = self._cycle_status(int(status))
+        if target_path:
+            self._overlay_footer_cache.pop(target_path, None)
+        if self._is_grid_mode():
+            self.on_grid_cell_mark(idx, new_status)
+        elif self.repo:
+            changed = self.store.mark_status_at(idx, new_status, self.repo)
+            if changed and self.group_images:
+                rec = self.store.record_at(idx)
+                if rec:
+                    try:
+                        self.repo.move_file_to_group(rec['filename'], new_status)
+                    except Exception:
+                        pass
+            if changed:
+                self._refresh_current_image()
+        self._refresh_overlay_preview()
+
     def _handle_numpad_digit(self, key: int) -> None:
+        if not self._is_numpad_grid_enabled():
+            return
         idx = self._index_for_numpad_key(key)
         if idx is None:
             return

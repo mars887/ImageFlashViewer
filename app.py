@@ -6,6 +6,7 @@ from imageflash.data.repo import SQLiteRepository
 from imageflash.services.scanner import scan_images
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QCoreApplication
+from PySide6.QtGui import QImageReader
 
 # Developer Notes (app.py)
 # - This is the application entrypoint. It parses CLI flags for export/delete
@@ -71,6 +72,10 @@ def main():
     # GUI mode
     QCoreApplication.setOrganizationName("ImageFlashViewer")
     QCoreApplication.setApplicationName("ImageFlashViewer")
+    try:
+        QImageReader.setAllocationLimit(1024)
+    except Exception:
+        pass
     app = QApplication(sys.argv)
 
     window = MainWindow(group_images=group_images)
