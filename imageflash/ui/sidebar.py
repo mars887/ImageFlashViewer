@@ -37,12 +37,12 @@ class SideBar(QWidget):
         self.lbl_unreviewed = QLabel("Непроверенных: 0")
 
         self.grid_cols_slider = QSlider(Qt.Horizontal)
-        self.grid_cols_slider.setRange(1, 3)
+        self.grid_cols_slider.setRange(CONFIG.grid_min_dimension, CONFIG.grid_max_dimension)
         self.grid_cols_slider.setValue(CONFIG.grid_default_cols)
         self.grid_cols_label = QLabel(f"Колонки: {CONFIG.grid_default_cols}")
 
         self.grid_rows_slider = QSlider(Qt.Horizontal)
-        self.grid_rows_slider.setRange(1, 3)
+        self.grid_rows_slider.setRange(CONFIG.grid_min_dimension, CONFIG.grid_max_dimension)
         self.grid_rows_slider.setValue(CONFIG.grid_default_rows)
         self.grid_rows_label = QLabel(f"Строки: {CONFIG.grid_default_rows}")
 
@@ -55,6 +55,8 @@ class SideBar(QWidget):
 
         self._build_ui()
         self._connect()
+        self._apply_grid_slider_style(self.grid_cols_slider)
+        self._apply_grid_slider_style(self.grid_rows_slider)
         self._sync_auto_balance_controls(bool(self.chk_grid_auto_balance.isChecked()))
 
     def _build_ui(self) -> None:
@@ -92,6 +94,37 @@ class SideBar(QWidget):
         self.chk_grid_auto_balance.toggled.connect(self._on_grid_auto_balance_toggled)
         self.chk_grid_only_grow.toggled.connect(self.gridAutoBalanceOnlyGrowToggled.emit)
         self.btn_jump_first.clicked.connect(self.jumpToFirstUnreviewed.emit)
+
+    def _apply_grid_slider_style(self, slider: QSlider) -> None:
+        green_stop = max(0.0, min(1.0, CONFIG.grid_numpad_max_dimension / float(CONFIG.grid_max_dimension)))
+        slider.setStyleSheet(
+            f"""
+            QSlider::groove:horizontal {{
+                height: 8px;
+                border-radius: 4px;
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #2f8f46,
+                    stop:{green_stop:.3f} #2f8f46,
+                    stop:{green_stop:.3f} #c79a2c,
+                    stop:1 #c79a2c
+                );
+            }}
+            QSlider::sub-page:horizontal {{
+                background: transparent;
+            }}
+            QSlider::add-page:horizontal {{
+                background: transparent;
+            }}
+            QSlider::handle:horizontal {{
+                width: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+                background: #f0f0f0;
+                border: 1px solid #444444;
+            }}
+            """
+        )
 
     def _sync_auto_balance_controls(self, enabled: bool) -> None:
         self.chk_grid_only_grow.setEnabled(enabled)

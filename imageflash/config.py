@@ -52,6 +52,10 @@ class Config:
     single_status_stripe_height: int = 10
     grid_status_stripe_height: int = 8
     grid_tile_spacing: int = 3
+    grid_min_dimension: int = 1
+    grid_max_dimension: int = 9
+    grid_numpad_max_dimension: int = 3
+    grid_adaptive_exact_search_max_dimension: int = 3
     # Default grid size
     grid_default_cols: int = 3
     grid_default_rows: int = 2

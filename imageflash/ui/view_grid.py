@@ -3,7 +3,7 @@ from __future__ import annotations
 from itertools import product
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QRect, QPoint, Signal, QTimer
+from PySide6.QtCore import Qt, QRect, QPoint, Signal
 from PySide6.QtGui import QPainter, QColor, QImage, QPixmap, QMouseEvent
 from PySide6.QtWidgets import QWidget
 from ..config import CONFIG
@@ -28,7 +28,7 @@ class ViewGridWidget(QWidget):
         self._rows = 1
         self._cols = 1
         self._items: List[Dict] = []  # each: {index:int, path:str, status:int}
-        self._images: Dict[int, QImage] = {}  # key: global index
+        self._images: Dict[int, QPixmap] = {}  # key: global index
         self._request_image = None  # callable(path, (w,h), callback)
         self._page_info: Optional[Tuple[int, int, int]] = None  # start,end,total
         self.setMinimumSize(200, 200)
@@ -52,8 +52,8 @@ class ViewGridWidget(QWidget):
         self._request_image = fn
 
     def set_grid_size(self, cols: int, rows: int) -> None:
-        cols = max(1, min(3, cols))
-        rows = max(1, min(3, rows))
+        cols = max(CONFIG.grid_min_dimension, min(CONFIG.grid_max_dimension, cols))
+        rows = max(CONFIG.grid_min_dimension, min(CONFIG.grid_max_dimension, rows))
         if cols == self._cols and rows == self._rows:
             return
         self._cols = cols
@@ -143,14 +143,16 @@ class ViewGridWidget(QWidget):
 
         return weights
 
+    def _blend_weights(self, weights: List[float], alpha: float) -> List[float]:
+        alpha = max(0.0, min(1.0, alpha))
+        return [1.0 + (weight - 1.0) * alpha for weight in weights]
+
     def _axis_size_candidates(self, total: int, axis: str, count: int) -> List[List[int]]:
         if count <= 1:
             return [[max(1, total)]]
 
         min_factor = float(CONFIG.grid_balance_min_factor)
         max_factor = float(CONFIG.grid_balance_max_factor)
-        levels = [min_factor, (min_factor + 1.0) * 0.5, 1.0, (1.0 + max_factor) * 0.5, max_factor]
-
         candidates: List[List[int]] = []
         seen: set[Tuple[int, ...]] = set()
 
@@ -160,10 +162,30 @@ class ViewGridWidget(QWidget):
                 seen.add(sizes)
                 candidates.append(list(sizes))
 
-        add_sizes([1.0] * count)
-        add_sizes(self._heuristic_weights(axis, count))
-        for combo in product(levels, repeat=count):
-            add_sizes(list(combo))
+        base_weights = [1.0] * count
+        heuristic = self._heuristic_weights(axis, count)
+        add_sizes(base_weights)
+        add_sizes(heuristic)
+
+        exact_limit = max(1, int(CONFIG.grid_adaptive_exact_search_max_dimension))
+        if count <= exact_limit:
+            levels = [min_factor, (min_factor + 1.0) * 0.5, 1.0, (1.0 + max_factor) * 0.5, max_factor]
+            for combo in product(levels, repeat=count):
+                add_sizes(list(combo))
+            return candidates
+
+        for alpha in (0.25, 0.5, 0.75):
+            add_sizes(self._blend_weights(heuristic, alpha))
+
+        for idx in range(count):
+            emphasized = list(heuristic)
+            emphasized[idx] = max(min_factor, min(max_factor, emphasized[idx] * 1.18))
+            add_sizes(emphasized)
+
+            relaxed = list(heuristic)
+            relaxed[idx] = max(min_factor, min(max_factor, 1.0 + (relaxed[idx] - 1.0) * 0.45))
+            add_sizes(relaxed)
+
         return candidates
 
     def _layout_score(self, col_widths: List[int], row_heights: List[int]) -> Tuple[float, List[float]]:
@@ -363,11 +385,11 @@ class ViewGridWidget(QWidget):
         return c
 
     def update_item_status(self, global_index: int, status: int) -> None:
-        for it in self._items:
+        for position, it in enumerate(self._items):
             if it.get("index") == global_index:
                 it["status"] = status
+                self.update(self._tile_rect(position // self._cols, position % self._cols))
                 break
-        self.update()
 
     def _item_at_point(self, pt) -> Optional[Dict]:
         i = 0
@@ -418,9 +440,8 @@ class ViewGridWidget(QWidget):
             self._tile_rect(index // self._cols, index % self._cols)
             for index in range(visible_count)
         ]
-        # If tiles are not laid out yet (very small), defer loading until after layout.
+        # If tiles are not laid out yet (very small), wait for the next resize/layout pass.
         if tile_rects and any(rect.width() < 8 or rect.height() < 8 for rect in tile_rects):
-            QTimer.singleShot(0, self.requestRescale.emit)
             return
 
         for index, it in enumerate(self._items[:visible_count]):
@@ -434,35 +455,55 @@ class ViewGridWidget(QWidget):
             token = self._image_request_serial
             self._expected_image_requests[idx] = (token, path, requested_size)
 
-            def make_cb(i: int, expected_token: int, expected_path: str, expected_size: Tuple[int, int]):
+            def make_cb(
+                i: int,
+                expected_token: int,
+                expected_path: str,
+                expected_size: Tuple[int, int],
+                target_rect: QRect,
+            ):
                 def _cb(img: QImage):
                     current = self._expected_image_requests.get(i)
                     if current != (expected_token, expected_path, expected_size):
                         return
-                    self._images[i] = img
-                    self.update()
+                    pixmap = QPixmap.fromImage(img)
+                    if (
+                        not pixmap.isNull()
+                        and (pixmap.width() > expected_size[0] or pixmap.height() > expected_size[1])
+                    ):
+                        pixmap = pixmap.scaled(
+                            expected_size[0],
+                            expected_size[1],
+                            Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation,
+                        )
+                    self._images[i] = pixmap
+                    self.update(target_rect)
                 return _cb
-            self._request_image(path, requested_size, make_cb(idx, token, path, requested_size))
+            self._request_image(path, requested_size, make_cb(idx, token, path, requested_size, QRect(rect)))
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(*CONFIG.background_color))
+        dirty_rect = event.rect()
+        fm = self.fontMetrics()
+        pad_x, pad_y = 6, 2
+        gap = 4
 
         # Draw tiles
         i = 0
         for rr in range(self._rows):
             for cc in range(self._cols):
                 rect = self._tile_rect(rr, cc)
+                if not rect.intersects(dirty_rect):
+                    i += 1
+                    continue
                 # Draw background for tile
                 p.fillRect(rect, QColor(*CONFIG.tile_background_color))
                 if i < len(self._items):
                     item = self._items[i]
-                    img = self._images.get(item.get("index", -1))
-                    if img is not None and not img.isNull():
-                        # Always scale to current tile size to avoid undersized/oversized cached images
-                        pm = QPixmap.fromImage(img).scaled(
-                            rect.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-                        )
+                    pm = self._images.get(item.get("index", -1))
+                    if pm is not None and not pm.isNull():
                         # center inside rect
                         x = rect.x() + (rect.width() - pm.width()) // 2
                         y = rect.y() + (rect.height() - pm.height()) // 2
@@ -481,9 +522,6 @@ class ViewGridWidget(QWidget):
                 p.setPen(QColor(*CONFIG.border_color))
                 p.drawRect(rect)
                 # Info badges (top-right): order right->left: Res, Size, Fmt
-                fm = self.fontMetrics()
-                pad_x, pad_y = 6, 2
-                gap = 4
                 cursor_x = rect.right() - 6
                 top_y = rect.y() + 6
                 if i < len(self._items):
@@ -545,26 +583,26 @@ class ViewGridWidget(QWidget):
             current_page = ((start - 1) // page_size) + 1 if total > 0 else 0
             text = f"{start}\u2013{end} of {total} | {current_page} of {total_pages}"
             metrics_padding = 6
-            fm = self.fontMetrics()
             tw = fm.horizontalAdvance(text) + metrics_padding * 2
             th = fm.height() + metrics_padding
             rect = QRect(8, 8, tw, th)
             # Badge background with semi-transparency
-            p.fillRect(rect, QColor(0, 0, 0, 140))
-            p.setPen(QColor(230, 230, 230))
-            p.drawText(rect.adjusted(metrics_padding, 0, -metrics_padding, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
+            if rect.intersects(dirty_rect):
+                p.fillRect(rect, QColor(0, 0, 0, 140))
+                p.setPen(QColor(230, 230, 230))
+                p.drawText(rect.adjusted(metrics_padding, 0, -metrics_padding, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
 
         # If showing paths, draw under each tile
         if self._show_paths:
             i = 0
-            fm = self.fontMetrics()
-            pad_x = 6
-            pad_y = 2
             for rr in range(self._rows):
                 for cc in range(self._cols):
                     if i < len(self._items):
                         item = self._items[i]
                         rect = self._tile_rect(rr, cc)
+                        if not rect.intersects(dirty_rect):
+                            i += 1
+                            continue
                         # Background bar
                         bar_h = fm.height() + pad_y * 2
                         bar_rect = QRect(rect.x(), rect.y() + rect.height() - bar_h, rect.width(), bar_h)
@@ -586,7 +624,6 @@ class ViewGridWidget(QWidget):
                     i += 1
 
     def resizeEvent(self, event) -> None:  # noqa: N802
-        self.requestRescale.emit()
         self._invalidate_layout_cache()
         self._images.clear()
         self._expected_image_requests.clear()
